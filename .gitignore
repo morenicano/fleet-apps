@@ -3,3 +3,18 @@ node_modules
 dist
 .dev.vars
 .DS_Store
+
+# Ignore deep incremental background logs in history archives
+**/docs/history/**/.system_generated/
+
+# Ignore deep incremental background logs in history archives
+**/docs/history/**/.system_generated/
+
+# System Noise
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Historical Archives
+docs/history/
+history/

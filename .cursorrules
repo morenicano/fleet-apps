@@ -1,0 +1,869 @@
+# GameProductions Global Laws & Standards
+
+This document serves as the absolute source of truth for all projects within the GameProductions organization. All AI interactions and development must adhere to these standards.
+
+## 1. Cloudflare-First Infrastructure
+- **Stack**: Projects must use Cloudflare's native serverless stack: Workers, KV (Key-Value), R2 (Storage), Durable Objects (State), and Queues (Background tasks). Relational persistence uses **Neon Postgres** (not D1) for the Foundation fleet — see Section 3.
+- **Modern Fullstack Runtime**: Applications utilize the unified **React Router v8 Fullstack SSR + Vite Environment API (`@cloudflare/vite-plugin`)** pattern. Single-pass bundling compiles both Cloudflare Worker edge logic and React Router client hydration into an optimized asset stream.
+- **Product Alignment**: All features must use the specific Cloudflare product that supports it (e.g., Neon Postgres for relational SQL, KV for caching).
+- **Apps as PWA**: All applications are set up as Progressive Web Apps (PWA) by default with offline asset fallback and manifest support.
+- **Configuration**: Use `wrangler.jsonc` exclusively. Never use `wrangler.toml`.
+- **Infrastructure as Code**: All bindings and environment variables must be defined in `wrangler.jsonc`.
+- **Resource Naming**:
+  - Cloudflare Workers MUST be named exactly `[project]`, with no tags or suffixes added.
+- **Observability**: Every `wrangler.jsonc` MUST include the following block to enable full diagnostic logging and worker traces:
+  ```jsonc
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1, // 100% sampling for full audit trails
+    "traces": {
+      "enabled": true
+    }
+  }
+  ```
+- **Git Metadata**: Every `wrangler.jsonc` MUST include a `GIT_REPO` variable in the `vars` block to link the project to its repository:
+  ```jsonc
+  "vars": {
+    "GIT_REPO": "https://github.com/GameProductions/{repo-name}"
+  }
+  ```
+
+## 2. Path-Based Routing Architecture
+- **Domain Pattern**: Every project is assigned a sub-domain on `gpnet.dev` (e.g., `project-name.gpnet.dev`).
+- **DNS Automation**: Cloudflare Workers automatically register DNS records for `gpnet.dev` subdomains when the `routes` property is defined in `wrangler.jsonc`.
+  - All projects MUST define their custom domain route: `"{project-name}.gpnet.dev/*"`.
+  - The `workers_dev` flag MUST be set to `false` for production.
+- **Unified Fullstack Hono + React Router Entrypoint**: Use a single Hono entry point at `apps/api/worker.ts` to mount API routes (`/api/*`), WebAuthn challenges (`/api/auth/*`), and proxy handlers (`/api/proxy/*`), with unmatched route traffic falling through directly to the **React Router v8 Server-Side Rendering (SSR) handler**.
+- **CDN Manifest & Icon Purity**: To ensure 3rd-party password managers (like 1Password / AgileBits) and external crawlers can securely bind rich icons, the PWA MUST expose `apple-touch-icon.png` and `favicon.png` as static assets in `public/`, referenced from `index.html` or `root.tsx` via `<link rel="apple-touch-icon">` and `<link rel="icon">`.
+- **Path Branching**: 
+  - `/api/auth/*`: Shared authentication (session, profile, passkeys, backup codes, OAuth) served from `packages/shared/auth/server`.
+  - `/api/*`: Reserved for bot logic, webhooks, and backend API.
+  - `/admin/*`: Dedicated directory for project-level administrative tools.
+  - `/*`: Rendered via React Router v8 fullstack SSR with edge loaders and client hydration.
+- **Webhook Exemption**: Any Bearer/Token auth guards or strict middlewares acting globally on the `/api/*` blanket must explicitly whitelist routes containing `/discord` or `/interactions`. Failure to do this will block native webhook validation tools from remote platforms (e.g., Discord) causing 401s that break server-to-server operations.
+- **CORS Consolidation**: CORS MUST be handled at the entry-point layer: `apps/api/worker.ts` for the `/api/*` namespace (dynamic allowlist of `*.gpnet.dev`, `*.glosonproductions.com`, localhost) and `apps/api/server.ts` for the local dev/deploy socket. Secondary CORS middlewares in sub-routers are strictly prohibited as they cause preflight (`OPTIONS`) request failures.
+
+## 3. Database & Persistence (SQL)
+- **Standard**: Use **Neon Postgres** via the serverless HTTP client (`drizzle-orm/neon-http` + `@neondatabase/serverless`) orchestrated purely through Drizzle ORM. The connection string is injected via the `DATABASE_URL` binding.
+- **ORM Policy **: **Drizzle ORM is STRICTLY REQUIRED** across all GameProductions projects. Legacy raw SQL/wrappers must be aggressively phased out.
+- **Schema Management**: All definitions must exist inside `db/schema.ts` (repository root) using `pgTable`, managed via `drizzle-kit`.
+- **Legacy Archival Standards**: All obsolete database structures, physical `.db`/`.sqlite` files, and raw SQL migrations MUST be moved into a root `archive/` directory. For in-place schema migrations, follow the strict standards defined in **Section 14**.
+
+## 4. User & Identity Management
+- **Account Creation**:
+  - **Cryptographic Hash Pattern (Ledger, GloBot, Lets Draw Down, Groupcord)**: Always generate a random cryptographic hash as the generic primary user ID first. Link 3rd-party integrations (Discord, Google) as secondary identities. These databases must remain completely independent of each other.
+  - **Raw Snowflake Pattern (I-AM, Food)**: For lightweight apps strictly coupled to a remote ecosystem, use the raw remote provider identifier (e.g., the Discord Snowflake ID) directly as the primary database ID to eliminate query overhead.
+- **Security Standard & Zero-Trust Authentication **:
+  - **Hashing**: Use PBKDF2 with **100,000 iterations** for all password hashing (native Cloudflare Worker limit).
+  - **Zero-Trust Step-Up Auth**: Administrative dashboards (`/admin`, `/superadmin`, and high-risk fleet actions) MUST NEVER rely solely on standardized SSO bearer tokens. Such routes MUST implement a **Biometric WebAuthn Challenge (Passkeys)** step-up verification. The backend middleware must confirm a cryptographic hardware signature from the user's physical device before yielding access to critical infrastructure.
+  - **Passkey Implementation Workflow **: 
+    - If a project already features a dedicated "User Account" or "Profile Settings" UI where users modify their core info, the Passkey CRUD module (list, generate, rename, revoke) MUST be natively embedded directly into that existing page.
+    - If a project is inherently lightweight (e.g., uses Discord SSO + step-up Zero Trust) and lacks a dedicated account page, it MUST construct a standalone `/settings` (Portal Settings) route dedicated exclusively to managing biometric hardware binders and recovery codes, maintaining the premium layout architecture established in the Foundation portal.
+  - **Step-Up API Standard**: 
+    - Administrative WebAuthn routes MUST be located in `apps/api/admin/webauthn.ts` (mounted at `/admin/webauthn`) for the legacy admin stack, and in `packages/shared/auth/server/routes/passkey.ts` (mounted at `/api/auth/passkeys`) for the shared stack.
+    - Standard Endpoints:
+        - `POST /admin/webauthn/generate-auth` (Assertion Challenge)
+        - `POST /admin/webauthn/verify-auth` (Assertion Verification)
+        - `POST /admin/webauthn/generate-registration` (Enrollment Challenge)
+        - `POST /admin/webauthn/verify-registration` (Enrollment Verification)
+    - All routes in this namespace MUST be protected by `sessionGuard` + `requirePasskeyFreshness`.
+  - **Step-Up State Machine**: Passkey step-up state is stored in the `sessions.passkeyVerifiedAt` column. `requirePasskeyFreshness(N)` in `packages/shared/auth/server/middleware/stepup.ts` returns `403 { requireWebAuthn: true }` for administrative routes until a successful verification refreshes the timestamp. The `passkey_verified` cookie from earlier versions is deprecated — the column-based freshness window is the single source of truth.
+- **Role Hierarchy**: 
+  - **Owner**: Full global control via the **Administration** suite.
+  - **Admin**: Project-specific administrative access.
+  - **Mod**: Content moderation and user management.
+  - **User**: Standard access.
+- **First User Auto-Elevation**: The very first user to successfully sign into any project MUST automatically be granted the owner role. This is determined by checking whether any user record exists in the database at the time of registration — if zero users exist, the new user becomes owner. This ensures every freshly deployed project always has at least one owner without manual intervention.
+- **User Management**: Always include full CRUD for user management, accessible to Mods and above.
+- **Administration Portal (`SystemAdministration`)**:
+  - **Component**: Owner-level tooling lives in `apps/web/pages/superadmin.tsx` (`SystemAdministration`), routed at `/superadmin`.
+  - **Pathing **: Administrative and owner tools are grouped under the protected `/superadmin`, `/roles`, `/tools`, and `/security` routes in `apps/web/main.tsx`.
+  - **Impersonation**: Must support "View As" mode with a persistent warning header.
+  - **Audit Logging **: Sensitive administrative actions MUST be logged using a centralized audit utility. This utility MUST comply with the **Security Standards** forensic standard (see Section 14), capturing actor, action, target entity, state changes, and network forensics (IP/UA).
+  - **Walkthrough History **: A full history of all project `walkthrough.md` files MUST be preserved and synchronized within the administration "Help" or "Audit" section for comprehensive architectural traceability.
+  - **Setup Guides **: The administration "Help" section MUST contain exhaustive, step-by-step setup instructions for all platform integrations. This includes:
+    - **Exact Enpoints**: Providing the project's specific callback and interactions URLs (e.g., `https://[project].gpnet.dev/api/...`).
+    - **App Listing Metadata**: Standardized descriptions and feature lists intended for third-party app stores/listings.
+    - **Constraint**: NEVER use the word "exhaustive" when presenting feature lists, even if the list is comprehensive.
+
+
+## 5. UI/UX Standards 
+- **Jargon-Free Language**: All user-facing text (labels, messages, notifications, descriptions, error messages) MUST be written in plain, non-technical language. Avoid developer terminology, internal system names, error codes, or implementation details unless the intended audience is explicitly technical (e.g., API documentation, developer guides, webhook configuration pages). If a non-technical user would need to guess what a message means, rewrite it.
+- **Rendered Text & Zero Raw JSON (Fleet-Wide Law)**: Unless the UI is explicitly and intentionally designed as a developer code editor, JSON viewer, or code block, all user-facing content — especially within activity logs, notifications, notification history, audit trails, and status inspectors — MUST ALWAYS be fully rendered into human-readable text, structured key-value attributes, and styled UI badges. Raw JSON strings, unparsed serialized blobs, or unformatted dump blocks are strictly prohibited in user-facing components.
+- **User & Entity Display Name Resolution (Fleet-Wide Law)**: Whenever user accounts or entity/record types are referenced in UI components, logs, notifications, audit trails, activity chronicles, or inspectors, they MUST ALWAYS be resolved and displayed as their human-readable **Display Names** (e.g. `Jane Doe`, with their username optionally following in parentheses such as `Jane Doe (@janedoe)` instead of raw UUIDs like `01a01b9b-...` or `user_123`) and formatted **Entity Titles** (e.g. `Household Budget`, `Checking Account`, `Subscription Renewal` instead of raw database table/column identifiers like `household_budgets` or `accounts`). Raw IDs or technical snake_case keys should only appear as subtle auxiliary badges when forensically necessary.
+- **Modal Centering & Background Scroll Lock (Fleet-Wide Law)**: All interactive modals, dialogs, full-history inspectors, and popups MUST be mounted at the root DOM layer (via `createPortal` to `document.body` or fixed full-viewport overlays) with **true viewport centering** (`fixed inset-0 z-50 flex items-center justify-center`). When any modal or dialog is open, background page scrolling MUST be strictly locked (`document.body.style.overflow = 'hidden'`). If the modal's contents exceed the viewable vertical space, internal scrolling MUST be handled strictly within the modal container's body (`overflow-y-auto max-h-[85vh]`) with styled custom scrollbars, preventing any outer page scrolling or unwanted backdrop shifts.
+- **Overlay Stacking Context & Viewport Edge Clamping (Fleet-Wide Law)**: All temporary overlay objects (dropdown menus, pop-up panels, tooltips, flyouts, comboboxes, and floating select menus) MUST be position-aware, elevated above all static page elements (cards, sticky headers, table rows, navigation bars) via elevated z-index tiers (`z-[1000]` or higher, or mounted directly to `document.body` via `createPortal`), and strictly clamped within viewport boundaries. Temporary overlays MUST NEVER extend beyond or be clipped by the edge of the screen, card borders, or `overflow: hidden` parent containers. When rendered near a screen boundary, overlays must automatically flip axis or clamp coordinates (`max-w-[calc(100vw-24px)]`, dynamic top/bottom placement) so they remain 100% visible and unobscured.
+- **PWA Status**: All applications must be fully progressive and configured as a Progressive Web App (PWA).
+
+
+
+- **High-Fidelity Utilities**:
+    - **Scrollable Lists**: Use a standardized `.scrollable-list` class with `max-height: 65vh; overflow-y: auto; overflow-x: hidden;`.
+    - **Custom Scrollbars**: Implement a sleek, custom-designed scrollbar for all scrollable containers.
+- **Onboarding**: Every new project MUST include a high-fidelity **Guided Tour** component for first-time users.
+- **Floating Header**: 
+  - Left-aligned: App Logo + App Name.
+  - Right-aligned: 
+    - **Signed In**: User drop-down menu with avatar.
+    - **Signed Out**: A prominent **"Sign In"** button that initiates the primary authentication flow.
+  - **Law**: Never alter branding, logos, or typography unless specifically requested by the user.
+- **Gradient Brand Typography (Fleet-Wide Law)**: Whenever an application name is displayed prominently in a **Header, Navbar, Hero, Landing banner, or Title bar**, the text MUST incorporate a sleek, high-contrast **CSS linear gradient** (e.g. `bg-gradient-to-r from-cyan-400 via-teal-300 to-emerald-400 bg-clip-text text-transparent` or product-tailored palette) to impart a modern, premium, state-of-the-art visual aesthetic, regardless of surrounding surface themes.
+- **Modern Version Badges**: Version indicators (in headers, sidebars, modals, and footers) MUST be rendered as high-fidelity pills with subtle borders, backdrop blur, and monospaced font formatting (e.g., `font-mono text-xs px-2 py-0.5 rounded-full bg-surface-muted/60 border border-border/80 text-text-secondary font-medium tracking-wide`).
+- **Landing Page **:
+  - Must comply with Google’s safety rules to avoid "dangerous site" classification.
+  - MUST include a compelling **Application Description** immediately following the hero section.
+  - MUST include a section labeled **"Features"** containing an exhaustive list of application capabilities.
+  - MUST include an **"Integrations"** section listing supported 3rd-party services and options.
+  - **Naming Policy **: **Application names must NEVER be prefixed with "GameProductions"** in UI headers, page titles, or internal identifiers. "GameProductions" is the organization name and its usage must be restricted to legal disclosures, copyright tags, and repository URLs. (e.g., "I Am" instead of "GameProductions I Am").
+- **Universal Footer**: Every project MUST implement a standard floating footer.
+  - Content: 
+    - Top Row: App Name + Version Badge (Left), Legal Links (Terms of Service, Privacy Policy, Cookie Policy) (Right)
+    - Bottom Row (Standard): `{new Date().getFullYear()} GameProductions™. All rights reserved.`
+- **Notifications, Alerts & Confirmations (Fleet-Wide Law)**:
+  - **Zero Native Browser Dialogs**: Under NO circumstances should native blocking browser dialogs (`window.alert()`, `window.confirm()`, or `window.prompt()`) ever be used. All notices and interactions must be non-blocking and styled within the application design system.
+  - **Informational Notices**: Use dismissable toasts (`toast.success()`, `toast.error()`, `toast.info()`).
+  - **Destructive & Operational Action Confirmations**: Action confirmations (such as deleting resources, revoking credentials, rebooting nodes, or unlinking accounts) MUST use styled **action snackbars** or in-app confirmation dialogs equipped with explicit inline `[Cancel]` and `[Confirm]` action triggers.
+  - **User Input & Prompts**: Never use `window.prompt()`. Always collect user input via styled modal dialogs, drawers, or inline form components.
+
+- **Reactive Data Synchronization**: All data-driven components (Lists, Ledgers, Summaries) MUST implement a global mutation listener. When a data-modifying action occurs (Add, Edit, Delete), the component MUST broadcast a global mutation event (e.g., `[app-name]-api-mutate`) to notify all active hooks watching that resource path to refetch data immediately. This ensures application-wide state consistency without requiring manual page refreshes.
+- **Searchable & Actionable Data Dropdowns**: Any time a dropdown menu is used, if the menu is connected to a data source (instead of being a list to control functions or actions), that list shall be searchable. In addition to that, if the menu is connected to a data source that uses CRUD logic, that searchable list shall also allow creating new items that are not found in the list.
+
+## 6. Local Development & Deployment
+- **Local-First Testing**: Mandatory local testing before any deployment. 
+- **Remote DB Binding**: Use `wrangler dev --remote` to connect local dev to the live Neon database.
+- **Publishing Workflow**: Local Test -> User Confirmation -> Commit (with version) -> Publish.
+- **Refactoring Policy**: Keep PWAs modular. If a component grows too large, suggest refactor options. **Never refactor without user confirmation.**
+- **Opportunistic Refactor Abstraction**: When modifying any code — whether fixing a bug, adding a feature, or adjusting existing logic — if you identify a clear opportunity to extract a reusable abstraction (function, component, hook, type, utility, or service), perform that extraction immediately as part of the same change. Do not defer it. This rule applies fleet-wide: every edit is an opportunity to reduce duplication and improve modularity. The only exception is when the extraction would fundamentally change the scope of the task — in that case, flag the opportunity and create a follow-up task rather than silently leaving the duplication.
+- **Modularize When Sensible**: Beyond explicit extraction opportunities, any time the logical structure of the code would be cleaner, more maintainable, or more testable as separate modules, do it. This includes splitting monolithic files, separating concerns across directories, decoupling tightly bound components, and organizing related logic into dedicated modules. Do not wait for a dedicated refactor ticket — if it makes the codebase better and fits within the current change, do it inline. Size is not a prerequisite; clarity is.
+
+## 7. Development & DevOps 
+- **Version Control**: GitHub (`GameProductions/`) for all code management.
+- **CI/CD**: Use GitHub Actions for auto-deploy.
+- **Version Format**: All version references MUST use the `v` prefix (e.g., `v1.17.3`). In commit message titles, the version MUST be wrapped in brackets: `[v1.17.3]`.
+- **Scope-Based Versioning**: The bump type is determined by the logical scope of changes, not commit count:
+  - **Patch** — bug fixes, refactors, database schema column additions/fixes, documentation, dependency updates, non-functional changes. Group all such changes into a single patch bump per session regardless of quantity.
+  - **Minor** — new features, new endpoints, new components, non-breaking API additions, internal breaking changes.
+  - **Major** — breaking architectural changes, framework migrations, public API breaks.
+- **Double-Bump Prevention**: The git pre-commit hook (`scripts/prepare-commit.cjs`) automatically handles version bumping for staged commits. If `package.json` is manually bumped prior to committing, the pre-commit hook preserves the manual version without double-bumping.
+- **No Automatic Major Bumps**: The system MUST NEVER auto-bump a major version. If the changes appear to warrant a major bump, suggest it explicitly and wait for user approval before applying.
+- **Version Skip Protection**: The bump mechanism MUST enforce sequential versioning. A jump from `v1.17.3` → `v1.56.0` (skipping 38 minors) or `v1.17.3` → `v2.0.0` (unapproved major) MUST be rejected as likely a typo or miscalculation. The allowed transitions are:
+  - Patch: increment the patch segment by 1 (`v1.17.3` → `v1.17.4`)
+  - Minor: increment the minor segment by 1, reset patch to 0 (`v1.17.3` → `v1.18.0`)
+  - Major: only with explicit user approval, increment major by 1, reset minor and patch to 0 (`v1.17.3` → `v2.0.0`)
+- **Commit Format**: All commit messages MUST follow this structured format:
+    1. **Prefix**: The current version from `package.json` in `[vX.Y.Z]` format.
+    2. **Title**: A concise, one-line summary.
+    3. **Details**: A prioritized, bulleted list of all significant changes.
+    4. **Context**: Mention of specific components/modules modified.
+    - *Example*: `[v3.9.0] Feature: Scheduled Post Sharing & Stability Fixes`
+- **CLI Maintenance**: Always keep `gh`, `wrangler`, and other CLI tools updated.
+- **Security & Hardening**: Maintain absolute health for Dependabot and vulnerability monitoring. Resolve security concerns immediately.
+- **Project Synchronization **: You MUST continuously track all tasks (historical and future) mapped inside `task.md` or any development checklist directly to the overarching GitHub Project 17. You will maintain strict 1:1 synchronization by orchestrating Draft Items natively via the GitHub CLI.
+  - **Tooling Execution**: Use `gh project item-create 17 --owner GameProductions --title "TASK_TITLE"` purely for granular micro-tasks to avert general repository spam.
+  - **History Retroaction**: All newly tracked workspaces must have any existing backlog of tasks aggressively caught up using `foundation/scripts/sync-github-tasks.sh`.
+
+## 8. Project Initialization
+- All new projects must be initialized via `create-project.md`.
+- **Legacy Migration**: Requires **manual approval**. Immediately notify the user if a repo is not v1.0.0 standard.
+
+
+## 9. Standard Directory Structure 
+All projects MUST adhere to this unified monorepo-style layout to ensure scalability and cross-stack integrity:
+
+### 1. Application Interface Layers (`apps/`)
+- **`apps/web/`**: The primary React/Vite PWA (Frontend UI).
+- **`apps/api/`**: The Hono/Cloudflare Workers API (Backend Orchestrator).
+- **`apps/bot/`**: Dedicated interface logic for Discord, Twitch, or GroupMe integrations.
+- **Entry Point**: The `main` field of the root `wrangler.jsonc` MUST point to `apps/api/worker.ts`.
+
+### 2. Shared Logic & Types (`packages/`)
+- **`packages/shared/`**: The absolute source of truth for Zod schemas, TypeScript interfaces, and shared utility functions. This directory MUST be used for any logic shared between `web` and `api` to prevent out-of-sync state.
+
+### 3. Core Data & Infrastructure (`db/`)
+- **`db/schema.ts`**: The centralized Drizzle ORM definition file.
+- **`db/migrations/`**: Managed SQL migration files.
+- **`drizzle.config.ts`**: Located at the root, mapping to the `db/` directory.
+
+### 4. Application Logic (inside `apps/web/` or `apps/api/`)
+- **`routes/`**: Entry points for UI pages or API endpoints.
+- **`layouts/`**: (Web) Page-level frames (e.g., `RootLayout`, `AdministrationLayout`).
+- **`components/`**: UI components.
+- **`hooks/`**: Custom React hooks.
+- **`context/`**: React Context providers.
+- **`services/`**: Client-side logic for external APIs and WebAuthn.
+- **`utils/`**: Utility functions specific to that application layer.
+
+### 5. Standardized Public Directory (`public/`)
+- **`public/brand/`**: App Logo, App Icon, and Banners.
+- **`public/legal/`**: `privacy.md`, `terms.md`, `security.md`.
+- **`public/well-known/`**: Platform verification files.
+
+### 6. Operations & Maintenance
+- **`scripts/`**: CI/CD, migration, and maintenance utilities.
+- **`archive/`**: Fail-safe storage for deprecated databases and structural legacy files.
+
+
+## 10. Tone & Branding
+- **Branding**: GameProductions copyright MUST be a permanent fixture in the footer.
+- **Versioning**: Only permitted in the App Footer and update prompts.
+- **Fluid Responsiveness**: Layouts must natively adjust based on visible space.
+- **Accessibility**: User Settings must include Contrast, Font Scaling, and Reduced Motion.
+- **Nomenclature Standard**:
+  - The highest system role is strictly **"OWNER"**. Never use "Owner" in code or UI.
+  - All administrative interfaces, portals, and sections MUST be labeled **"Administration"**.
+  - Terminology must remain professional; avoid using "Power" or jargon in administrative prompts.
+
+
+
+## 11. Build & Styling Standards 
+- **Law 130 (Tailwind v4 Standard)**: 
+  - All projects MUST use **Tailwind CSS v4** as the primary styling engine.
+  - **Integration**: Must use the native @tailwindcss/vite plugin in vite.config.ts.
+  - **Prohibition**: The use of legacy postcss.config.js or tailwind.config.js is strictly prohibited for standard CSS processing to ensure maximum build-time performance and absolute structural purity.
+  - **Entry Point**: The primary CSS file (e.g., src/index.css) MUST use the modern @import "tailwindcss"; directive.
+
+## 12. Naming Conventions & Code Style 
+- **Database (Drizzle/SQL)**:
+  - **Table Names**: Must be `snake_case` in the database definition and `camelCase` for the TypeScript export (e.g., `export const userSettings = pgTable('user_settings', ...)`).
+  - **Column Names**: Must be `snake_case` in the database and `camelCase` in the Drizzle property mapping.
+  - **Indexes**: Must follow the pattern `idx_[table]_[column]`.
+- **File Naming**:
+  - **Components**: Use `PascalCase.tsx` (e.g., `UserCard.tsx`).
+  - **Utilities/Hooks/Services**: Use `kebab-case.ts` (e.g., `use-auth.ts`, `date-utils.ts`).
+  - **Routes**: Use `kebab-case.tsx` for route files.
+- **Variable & Code Naming**:
+  - **Variables/Functions**: Use `camelCase`.
+  - **Classes/Interfaces/Types**: Use `PascalCase`.
+  - **Environment Variables**: Use `UPPER_SNAKE_CASE`.
+- **React Components**:
+  - Always use functional components with explicitly typed props.
+  - Deconstruct props in the function signature for clarity.
+
+## 13. High-Performance Infrastructure 
+- **Rule 13.1 (KV Caching)**: High-computation or frequently accessed configuration state must be offloaded to Cloudflare KV integrations to reduce database query bottlenecking.
+- **Rule 13.2 (Drizzle Preparing)**: Serverless functions routing high-frequency pathways must precompile Drizzle SQL AST parameters via `.prepare()`.
+- **Rule 13.3 (Rate-Limit Transparency)**: The rate limiter in `apps/api/utils/rate-limit.ts` MUST return `429` with a structured JSON body on throttle. Durable Object / KV-backed limiters SHOULD provide countdown and retry information (`X-RateLimit-Limit`, `X-RateLimit-Remaining`, `Retry-After`) on throttled responses.
+- **Rule 13.4 (Automated Testing)**: Projects must deploy Vitest for core pathway integrity checking.
+- **Rule 13.5 (Disaster Recovery)**: Leverage Cloudflare Cron triggers and endpoints to export disaster-recovery binary or JSON structural dumps to securely attached R2 buckets.
+- **Rule 13.6 (Foreign Indexing)**: Explicitly map native database indexing via `index()` usage inside `drizzle-orm` mappings for heavily queried foreign keys (`userId`) to prevent full table scans.
+- **Rule 13.7 (PWA Modern Manifest & Offline Standards)**:
+  - **Web App Manifest Specification**: All applications MUST declare a modern `manifest.json` / `manifest.webmanifest` containing:
+    - **`id` & `scope`**: Explicit `id` attribute (e.g. `/?source=pwa` or `https://<app>.gpnet.dev/`) to prevent duplicate installs, and bounded `scope: "/"`.
+    - **Display & Window Overrides**: `display: "standalone"` with `display_override: ["window-controls-overlay", "standalone", "minimal-ui"]` to support modern custom draggable titlebars and desktop window controls.
+    - **Rich Installation Descriptors**: Define high-resolution desktop (`form_factor: "wide"`) and mobile (`form_factor: "narrow"`) screenshots in the `screenshots` array to unlock rich native browser app-store install prompts.
+    - **Maskable & Monochrome Icon Suite**: In addition to standard icons, provide adaptive Android icons with `purpose: "maskable any"` and monochrome badge icons (`purpose: "monochrome"`).
+    - **Quick OS Shortcuts**: Provide a `shortcuts` array for high-frequency deep-link actions (e.g., *Security Hub*, *New Transaction*, *Settings*) directly from the device home screen/app launcher.
+  - **Service Worker Lifecycle & Offline Cache**: Implement `sw.js` offline caching logic with active `skipWaiting()` and `clients.claim()` protocols for instant WebUI visual resolution and seamless version transitions upon disconnected state.
+- **Rule 13.8 (E2E Validation)**: Advanced projects must configure robust end-to-end user-flow validations simulating human navigation via the `Playwright` engine.
+- **Rule 13.9 (Error Sanitization)**: API handlers MUST implement production-aware error catching. In `production`, sensitive identifiers, raw database errors, and internal configuration keys must be stripped from the response body and replaced with generic error messages (e.g., "An internal error occurred") to prevent information disclosure.
+- **Rule 13.10 (Shared KV Partitioning)**: To prevent crosstalk in shared KV namespaces (e.g., `FLEET_SECURITY_CACHE`), all project-specific keys MUST be prefixed with the unique identifier derived from the `APP_NAME` environment variable. Standard patterns: `fs:bot:${APP_NAME}:...` for service state, and `fs:config:${APP_NAME}:...` for service-specific overrides. Global keys (e.g., `fs:block:${ip}`) must be used exclusively for cross-platform forensic data.
+- **Rule 13.11 (Non-blocking I/O & CPU Integrity)**: All non-essential operations (e.g., audit logging, telemetry, cache warming) MUST be orchestrated via `c.executionCtx.waitUntil()`. This prevents secondary background logic from consuming the primary request's CPU quota and ensures minimum response latency.
+- **Rule 13.12 (Cold Storage & R2 Offloading)**: High-volume datasets or large metadata blobs (historical logs, detailed transaction data, media) MUST be migrated to Cloudflare R2 (Cold Storage) via a dedicated `ArchiveService`. The relational database MUST remain lean, reserved exclusively for frequently accessed relational data.
+- **Rule 13.13 (Heavy Task Orchestration - Queues)**: Any operation with a projected CPU duration exceeding 10ms or involving bulk data mutations MUST be offloaded to Cloudflare Queues. The API worker MUST only act as a thin ingress, pushing task payloads into the queue for asynchronous processing to prevent Error 1102 (CPU Limit Exceeded).
+
+- **Rule 13.14 (Automatic Asset Recovery)**: All PWAs MUST implement a global error listener in the root component to detect failed network requests (`404`) for hashed assets within the `/assets/` directory. If a critical script or stylesheet fails to load (typically due to a stale PWA cache after a new deployment), the application MUST automatically trigger a `window.location.reload()` to force a clean synchronization with the latest server-side bundle. 
+- **Rule 13.15 (KV Write Coalescing)**: To prevent hitting Cloudflare's hard limit of 1 write per second per key, all high-frequency KV updates (specifically rate-limit counters) MUST implement a **write-coalescing** mechanism. State updates occurring within 1000ms of a previous write to the same key MUST be dropped unless the update is a security-critical state change (e.g., a "Shield Active" block trigger).
+- **Rule 13.16 (Fleet Activity Queue)**: All projects acting as producers MUST bind to the `fleet-activity` queue via the `FLEET_ACTIVITY` environment variable. High-volume audit trails and forensic telemetry MUST be offloaded to this queue to ensure zero-latency for the end-user and centralized durability in the Foundation database.
+- **Rule 13.17 (PII Redaction & Forensic Purity)**: Before any data is committed to the `FLEET_ACTIVITY` queue or local `audit_logs`, the `redactSensitiveData` utility MUST be executed on all `oldValues`, `newValues`, and `metadata` payloads. Keys including `password`, `token`, `secret`, `key`, `email`, and `phone` MUST be masked to ensure forensic logs remain free of PII and security credentials.
+- **Rule 13.18 (Discord Slash Command Taxonomy, Interactions & User-App Standards)**:
+  - **Category Rooting & Subcommand Hierarchy**: Slash commands sharing a logical domain (e.g. `security`, `maintenance`, `admin`, `verse`, `vip`, `giveaway`) MUST be registered under a single root command category utilizing native Discord **Subcommands (`type: 1`)** or **Subcommand Groups (`type: 2`)** rather than fragmented flat root commands (e.g. `/admin-stats`, `/admin-logs` $\rightarrow$ `/admin stats`, `/admin logs`).
+  - **Contextual Option Prompting**: Subcommands must define only the specific options required for that exact action. Flat commands with generic `action` dropdowns that clutter the user with unused optional arguments are prohibited.
+  - **Permission Scoping & Installation Contexts**:
+    - Sensitive categories (e.g., `security`, `maintenance`, `admin`) MUST set default member permission constraints (`default_member_permissions: "8"` for Administrator or `"32"` for Manage Server) at the root command level.
+    - Global utilities and consumer bots MUST explicitly declare `integration_types` (`0` for Guild Install, `1` for User Install) and `contexts` (`0` for Guilds, `1` for Bot DMs, `2` for Private Channels / Group DMs) to support user-installable app functionality where appropriate.
+  - **Immediate Interaction Deferral (3s Hard Limit)**: All Discord button interactions (`type: 3`), select menus, and slash commands (`type: 2`) with async operations or external I/O (R2, DB, KV, third-party APIs) MUST immediately return an interaction deferral (`type: 5` for commands, `type: 6` for component updates) within 50ms, deferring all heavy execution to `c.executionCtx.waitUntil()` to prevent Discord gateway timeout errors.
+  - **Edge-Optimized Dynamic Autocomplete (`type: 4`)**: Autocomplete interactions (`type: 4`) MUST return responses synchronously within 1.5s capped at 25 choices (`choices: Array<{ name: string, value: string | number }>`). Autocomplete resolvers MUST leverage local in-memory lookup or `FLEET_SECURITY_CACHE` / KV caching to avoid slow database scans on each keystroke.
+  - **Interactive Modals & Advanced Select Components**:
+    - Complex text inputs, multi-line notes, and custom feedback dialogs MUST utilize native Discord **Modal Submissions (`type: 9`)** containing `text_input` (`type: 4`) components.
+    - User/role/channel selections MUST leverage native specialized select components (`type: 5` User Select, `type: 6` Role Select, `type: 7` Mentionable Select, `type: 8` Channel Select with `channel_types` filters) instead of raw text snowflake inputs.
+- **Rule 13.19 (Dynamic RBAC Engine & Edge Cache Standard)**:
+  - **No Static/Hardcoded Privilege Checks**: Features, API routes, and Discord slash commands that are restricted by Role-Based Access Control (RBAC) MUST NEVER rely on hardcoded user IDs, Discord Snowflakes, or static arrays in source code.
+  - **Central Authority in Foundation**: Foundation serves as the Single Source of Truth for all fleet permissions, roles, and user assignments via the `/roles` and Permissions Engine.
+  - **Edge-Cached Fast Evaluation**: To ensure sub-millisecond evaluation (<1ms) and eliminate HTTP latency during high-frequency API routes and Discord interactions, active user permissions MUST be synchronized from Foundation directly to `FLEET_SECURITY_CACHE` (`fs:perms:user:<userId>` and `fs:perms:discord:<discordId>`). Project bots and services MUST evaluate permissions locally from the shared KV cache rather than performing synchronous HTTP queries to Foundation.
+  - **Discrete Permission Nodes**: Privileges must be modeled as discrete, namespaced permission nodes (e.g., `fleet:security:manage`, `maintenance:toggle`, `globot:vip:admin`, `audit:read`).
+  - **Manifest Discovery**: Projects declaring custom administrative nodes must export a structured permission manifest for automatic registration in Foundation.
+- **Rule 13.20 (Dual-Vault 1Password & UUID Referencing Standard)**:
+  - **Vault Segmentation**:
+    - **`Fleet Services` (`6wgu5yz5yphvacdimgc64ej65i`)**: Dedicated exclusively to first-party Cloudflare Workers, PWAs, Discord bot tokens, APIs, JWT/service secrets, and Neon PostgreSQL database credentials across the GameProductions fleet.
+    - **`Self-Hosted Infrastructure` (`57s77wi4sbpj5zxxm7habzczo4`)**: Dedicated exclusively to on-premise hardware nodes (Synology, UGREEN, QNAP, TrueNAS, Unraid, Drobo, Linux VPS), Portainer environments, Docker compose stacks, media connectors (*Arr suite, Stash), and sidecar agent tokens (`foundation-agent`).
+  - **Mandatory UUID Syntax**: All `op://` secret references in codebase templates, `.dev.vars.tpl`, CI/CD workflows, and deployment scripts MUST use the exact **Vault UUID** and **Item UUID** (e.g. `op://6wgu5yz5yphvacdimgc64ej65i/<ITEM_UUID>/<FIELD>` or `op://57s77wi4sbpj5zxxm7habzczo4/<ITEM_UUID>/<FIELD>`) rather than human-readable string names. This prevents breakage from item renames and eliminates shell quoting ambiguities.
+  - **Strict Secret Isolation**: Cross-pollination between these two vaults is strictly prohibited.
+- **Rule 13.21 (Universal API Versioning, Manifest Registration & Deprecation Lifecycle)**:
+  - **Two-Dimensional Versioning Model**:
+    - **Major API Contract (`v1`, `v2`)**: Governs structural request/response breaking changes and route pathing (e.g. `/api/v1/...` or `/api/...` for current default v1).
+    - **Semantic Feature Stamping (`sinceVersion`)**: Every endpoint declared in `@shared/api-manifest` MUST specify the exact semantic release version (e.g. `1.149.0`) in which it was introduced to enable changelog tracking.
+  - **Mandatory Manifest Registration**: All new public, administrative, integration, or sidecar API endpoints implemented in any fleet project MUST be registered in `packages/shared/api-manifest/registry.ts` with explicit HTTP method, path, category, auth tier, permission node, 1Password vault reference (if applicable), and request/response examples.
+  - **Graceful Deprecation Policy**:
+    - Endpoints marked for retirement MUST set `deprecated: true`, `deprecatedSince: "X.Y.Z"`, and provide a clear `deprecationNotice` directing developers to the successor route.
+    - Deprecated endpoints MUST return a standard `Sunset` and `Deprecation: @<timestamp>` HTTP response header.
+    - Breaking changes must maintain a minimum 30-day coexistence window before obsolete routes are permanently unmounted.
+
+## 14. Database Migration Standards 
+- **Archive Before Action**: Any destructive change (table drop, column removal, type change) MUST be preceded by an archival step. Rename the existing table to `[original_name]_archive_[timestamp]`.
+- **Rebuild with Compliance**: Reconstruct the table using the new, compliant structure explicitly defined in `schema.ts`.
+- **Data Hydration**: Migrate data from the archive back into the new structure.
+- **Rule Enforcement**: Apply all organizational rules (e.g., encryption, normalization, strict typing) during migration to make the data compliant with the new structure.
+- **Auto-Generation**: For new required fields that didn't exist in the legacy data (e.g., `severity`, `actorId` hashes), use appropriate defaults or generated values if the field usually provides them.
+- **Human Verification**: If a required field cannot be reasonably auto-populated or generated, STOP and verify options with the user.
+
+- **1:1 Validation**: Always perform a 1:1 row count verification between the archive and the new table. Report the final result and any discrepancies to the user.
+- **Legacy Purging**: Once a migration is confirmed by the user as successful, the archive table may be dropped to maintain database hygiene.
+## 15. AI Assistant Standards 
+- **Language Standard**: All AI interactions, agent persona communications, status reports, tool summaries, and user-facing responses MUST be in English. No other languages are permitted unless explicitly requested.
+- **Tone & Jargon**: The assistant must maintain a professional and premium tone. Use of any themed jargon or informal terminology is strictly prohibited.
+- **Migration & Verifiability**: During database migrations (Rule 14), the agent MUST explicitly perform a 1:1 row count verification between the archive and new table. The agent MUST report the exact results and any anomalies to the user before requesting final decommission approval.
+- **Operational Consistency**: Maintain English as the sole operational language for all internal and external communication.
+- **Intellectual Honesty**: Always be honest in your responses. If you disagree with a request because it would do more harm than good, is illogical, or has negative downstream consequences, say so directly. A "yes" is never required out of politeness. If you have an alternative recommendation, voice it — we can discuss trade-offs and decide how to proceed together. Silence or false agreement in the face of a bad idea is a disservice to the codebase.
+- **First-Time Writing Standard**: When updating documentation, writing code comments, or crafting any user-facing dialog, always write as the original text — not as a change, update, or modification. Write as if implementing the feature or concept for the first time. The only exceptions are items whose purpose is to highlight change (changelogs, what's new modals, onboarding tour steps that announce new capabilities).
+
+## 16. Standardized Identity Schema
+To ensure fleet-wide interoperability and unified identity management, all projects MUST adhere to the "Gold Standard" schema for users, social identities, and multi-factor authentication.
+
+### 16.1 Users Table (`users`)
+- `id`: `text('id').primaryKey()`
+- `email`: `text('email')` (nullable; users may be SSO-only)
+- `displayName`: `text('display_name')`
+- `globalRole`: `text('global_role').default('user')` (Standardized from legacy `role`. Top role is `OWNER`)
+- `status`: `text('status').default('active')`
+- `passwordHash`: `text('password_hash')` (PBKDF2; nullable for SSO-only accounts)
+- `avatarUrl`: `text('avatar_url')`
+- `lastActiveAt`: `text('last_active_at')`
+- `createdAt`: `text('created_at').default(sql`CURRENT_TIMESTAMP`)`
+
+### 16.2 User Identities Table (`user_identities`)
+- `id`: `text('id').primaryKey()`
+- `userId`: `text('user_id').references(() => users.id)`
+- `provider`: `text('provider')` (`discord`, `google`, `dropbox`, `onedrive`)
+- `providerUserId`: `text('provider_user_id')`
+- `email`: `text('email')`
+- `name`: `text('name')`
+- `avatarUrl`: `text('avatar_url')`
+- `accessToken`: `text('access_token')`
+- `refreshToken`: `text('refresh_token')`
+- `tokenExpiresAt`: `text('token_expires_at')`
+
+### 16.3 Backup Codes Table (`backup_codes`)
+Replaces legacy `backupCodesJson` blob on the `users` table.
+- `id`: `text('id').primaryKey()`
+- `userId`: `text('user_id').references(() => users.id)`
+- `codeHash`: `text('code_hash')` (Individual hashed entries using PBKDF2/Argon2)
+- `usedAt`: `text('used_at')`
+- `createdAt`: `text('created_at').default(sql`CURRENT_TIMESTAMP`)`
+
+### 16.4 Geographic Session Tracking
+To ensure absolute forensic traceability, the `sessions` table MUST include:
+- `ipAddress`, `ipV4`, `ipV6`, `cfRay`, `location` (city, country), `deviceName`, `os`, `browser`.
+- These must be populated from the Cloudflare `cf` metadata object and request headers on every login/verification.
+
+### 16.5 MFA & Session Hardening (Forensic Standard)
+To ensure absolute account integrity and forensic traceability, all identity systems MUST implement the following:
+- **Session Geolocation**: The `sessions` table MUST include network and device metadata: `ipAddress`, `ipV4`, `ipV6`, `cfRay`, `location` (city, country), `deviceName`, `os`, `browser`.
+- **Dual-Stack IP Tracking**: All security tables (`sessions`, `passkeys`, `audit_logs`) MUST track both `ip_v4` and `ip_v6` addresses to ensure transparency across all network types. The `logAudit` utility MUST automatically detect and separate these addresses using the `cf-connecting-ip` and `cf-pseudo-ipv4` headers.
+- **MFA Usage Tracking**: The `passkeys` table MUST track usage forensics: `lastUsedAt`, `lastUsedIpV4`, `lastUsedIpV6`, `lastUsedCity`, `lastUsedCountry`, `lastUsedRegion`, `lastUsedLatitude`, `lastUsedLongitude`, and `lastUsedUa`.
+- **Recovery Logic**: Passkey-only systems MUST generate 10 high-entropy recovery codes stored as individual hashes in the `backup_codes` table. These codes MUST be displayed to the user immediately upon successful passkey enrollment with a secure download option.
+- **Biometric Metadata**: Passkey entries MUST include an `aaguid` field for hardware identification, mapped to a human-readable provider name in the UI.
+
+### 16.6 Session Persistence & Lifecycle
+- **Persistence Toggle**: All login flows (Discord, Passkey, Password) MUST support an optional `persistent` flag (boolean).
+- **Session Duration**:
+  - `Temporary` (Default): Expires in 24 hours.
+  - `Persistent` (Stay Signed In): Expires in 30 days.
+- **Database Schema**: The `sessions` table MUST include an `isPersistent` column (`integer`).
+
+### 16.7 UI/UX Forensic Parity & Reactive State
+- **IP Labeling**: UIs MUST explicitly label and display BOTH IPv4 and IPv6 addresses when available. Use standard "IPv4:" and "IPv6:" prefixes. Never label an IPv6 address as IPv4.
+- **Metadata Visibility**: Security listings (Sessions, Passkeys) MUST surface full high-fidelity forensic metadata including:
+    - **Network**: IPv4 and IPv6 addresses with explicit labels and dual-stack transparency.
+    - **Geographic**: Granular location details (City, State/Region, Country, Latitude/Longitude).
+    - **Device**: Comprehensive context including Browser, OS, and parsed Device Name from User-Agent.
+    - **Hardware Branding**: Full AAGUID metadata including high-quality manufacturer logos (SVG/CDN), security classification (Hardware vs Software), and manufacturer attribution.
+    - **Temporal**: Precise timestamps for Creation and Last Usage, along with an absolute Usage Counter.
+- **Session Lifecycle UI**: Active session lists MUST include a "Current Session" badge and a "Persistence" indicator (Persistent vs Temporary), accompanied by a legend explaining these security states.
+- **Reactive CRUD**: All security management architecture (Rename, Revoke, Enroll) MUST utilize optimistic UI updates or immediate state refreshes to reflect changes without requiring a full page reload.
+- **Passkey Enrollment**: Enrollment logic MUST generate and display 10 high-entropy recovery codes immediately upon successful binding, with a mandatory "Saved" verification and download option.
+
+## 17. Centralized Secret, Credential & Environment Variable Governance (Foundation & 1Password SSoT)
+- **1Password & Foundation as the Single Source of Truth**:
+  - All credentials, API tokens, service keys, JWT secrets, database connection strings, container environment variables, and stack configuration across every fleet project MUST be managed exclusively through **1Password** and **Foundation**.
+  - All CRUD operations (Create, Read, Update, Delete) for credentials, environment variables, and configurations must be executed via Foundation's **1Password & Fleet Hub** (`/vaults`) or the **Fleet Application Gateway** (`/api/v1/fleet`).
+  - Storing, hardcoding, or staging plaintext credentials in `.env` files, source code, dockerfiles, or git repositories is strictly prohibited.
+- **Strict Two-Vault Segmentation & UUID Law**:
+  - **`Fleet Services` (`6wgu5yz5yphvacdimgc64ej65i`)**: Dedicated exclusively to first-party Cloudflare Workers, PWAs, Discord bot tokens, web APIs, JWT/service secrets, and Neon PostgreSQL database credentials across the fleet.
+  - **`Self-Hosted Infrastructure` (`57s77wi4sbpj5zxxm7habzczo4`)**: Dedicated exclusively to on-premise hardware nodes (Synology, UGREEN, TrueNAS, VPS), Portainer environments, Docker compose stacks, container environment variables, media connectors (*Arr suite, Stash), and `foundation-agent` tokens.
+  - **Mandatory UUID Syntax**: All `op://` secret references in codebase templates, `.dev.vars.tpl`, compose files, and CI/CD workflows MUST use the exact **Vault UUID** and **Item UUID** (e.g. `op://6wgu5yz5yphvacdimgc64ej65i/<ITEM_UUID>/<FIELD>` or `op://57s77wi4sbpj5zxxm7habzczo4/<ITEM_UUID>/<FIELD>`) rather than human-readable string names.
+  - **Strict Secret Isolation**: Cross-pollination between these two vaults is strictly prohibited.
+- **Item Categorization & Tagging**: Every 1Password item MUST adhere to the following metadata standard:
+  - **Title Pattern**: `[Project Name] - [Service]` (e.g., `GloBot - Discord`).
+  - **Mandatory Tags**: `[Project Name]`, `[Service Provider]`, `Bot` (for all bot-related integrations), `fleet`.
+  - **Detailed Notes**: Items must include detailed notes describing the purpose, associated project routes, and service provider links.
+- **Sensitive Metadata Storage**: Non-secret but sensitive infrastructure metadata (Application IDs, Public Keys, Client IDs) MUST be stored as **Secure Notes** in 1Password with the same tagging standard.
+- **Proactive Hardening**: 
+  - Any local `.env` files or hardcoded secrets discovered in the codebase MUST be immediately migrated to 1Password and purged from local storage.
+  - CI/CD workflows MUST use the `1password/load-secrets-action` as the authoritative mechanism for environment injection.
+
+## 18. Step-Up Authentication & Administrative Routing (Fleet Standard v6.1)
+- **Administrative Sub-Router**: All biometric Step-Up authentication logic MUST be centralized in a dedicated administrative WebAuthn sub-router located at `apps/api/admin/webauthn.ts`, with shared-stack parity in `packages/shared/auth/server/routes/passkey.ts`.
+- **Standardized Endpoints**: The following endpoints are strictly required for administrative security parity:
+    - `POST /admin/webauthn/generate-registration`: Generates options for a new passkey.
+    - `POST /admin/webauthn/verify-registration`: Verifies and persists a new passkey.
+    - `POST /admin/webauthn/generate-auth`: Generates a biometric challenge for an existing session.
+    - `POST /admin/webauthn/verify-auth`: Verifies the challenge and refreshes `sessions.passkeyVerifiedAt`.
+- **Middleware Enforcement**:
+    - These routes MUST be protected by `sessionGuard` to identify the actor.
+    - Administrative routes (`/admin/*`) MUST be guarded by `requirePasskeyFreshness(N)` in `packages/shared/auth/server/middleware/stepup.ts`, returning `403 { requireWebAuthn: true }` until a fresh verification is recorded.
+- **Step-Up Freshness Window**: The `passkeyVerifiedAt` column on `sessions` is the single source of truth for step-up state. The freshness window defaults to 15 minutes and is configured via `config.passkey.stepUpWindow`.
+
+## 19. Passkey Standardization & Forensic Standards (v6.1)
+- **Encoding Standard**: All WebAuthn binary data (Credential IDs, Public Keys, Signatures) MUST be encoded using **base64url**. Standard `base64` is strictly prohibited to ensure maximum URL and database compatibility.
+- **Biometric Isolation (Vault Service)**: Sensitive biometric identifiers, specifically the `publicKey` (encoded as base64url) MUST NEVER be stored in the relational database (`passkeys` table). The public key MUST be stored exclusively in the `VaultService` under the `PASSKEY_PUBLIC_KEY` secret name, isolated by the passkey ID.
+- **Passkey ID Indexing**: The `passkeys` table uses the base64url credential ID as its primary key for verification lookups. (SHA-256 hashing of the credential ID is a planned hardening step but is NOT currently implemented — do not assume hashed identifiers.)
+- **AAGUID High-Fidelity Branding**: Passkey registration and listing MUST implement rich AAGUID metadata mapping. 
+    - **Logo Integration**: Display high-quality logos for recognized providers (Apple, Google, Microsoft, Yubico) using verified SVGs or CDN-hosted assets.
+    - **Security Grading**: Explicitly label the security level of the hardware (e.g., "Hardware Protected (TEE/SE)", "Software Protected (Fallback)").
+    - **Manufacturer Attribution**: Surface the manufacturer name derived from the AAGUID.
+- **Forensic Granularity**: All passkey registrations and authentication events MUST capture:
+    - **Dual-Stack Network Data**: Explicitly log both `ip_v4` and `ip_v6` addresses for every lifecycle event.
+    - **Granular Geolocation**: Log `city`, `country`, `region`, `latitude`, and `longitude` derived from Cloudflare headers.
+    - **Audit Continuity**: Every passkey record MUST maintain a permanent `registration_forensics` block and a rolling `last_used_forensics` block.
+- **Administrative Clearing**: Upon transition to the base64url and Vault standard, all existing legacy passkey registrations MUST be cleared from the database to ensure state purity and security compliance.
+
+## 20. Role Nomenclature & Access Standards
+- **Owner Role**: The highest level of authority within any project is the **owner** role (case insensitive — Owner, OWNER, owner are all valid). It is the top-tier role in the hierarchy.
+- **Usage in Code & UI**: Using "owner" in code (variable names, type definitions, route guards), file paths, and documentation is perfectly fine, especially when describing restrictions limited to that role. In UI labels and user-facing text, prefer "Owner" (capitalized) for clarity.
+- **Prohibited Terminology**: Do not use "God Mode", "Supreme", "Power User", or any other informal jargon to describe administrative roles or interfaces. Owner and Admin are sufficient and professional.
+- **Interface Standard**: All high-level administrative tools, dashboards, and portals MUST be collectively referred to as **Administration**.
+- **Routing Standard**: Access to owner-level administrative features MUST be gated via the protected routes in `apps/web/main.tsx` (`/superadmin`, `/roles`, `/tools`, `/security`) and the `/admin/*` API namespace.
+
+## 21. Migration Lifecycle & Squashing (Standard v6.1)
+- **Milestone Squashing**: Periodically, individual migrations in `db/migrations/` MUST be squashed into a single `0000_initial_schema.sql` to ensure fresh install reliability.
+- **Archiving Workflow**:
+  1. **Preservation**: Move existing `.sql` files to `archive/migrations/history_[timestamp]/`.
+  2. **Clean Slate**: Delete the `db/migrations/meta/` directory to force a full schema regeneration.
+  3. **Consolidation**: Run `npx drizzle-kit generate` (Postgres dialect, config in `drizzle.config.ts`) to create a clean, single-file baseline from the current `schema.ts`.
+  4. **Naming**: Rename the generated `.sql` file to `0000_initial_schema.sql`.
+- **Apply Migrations**: Use `npx drizzle-kit migrate` (or `drizzle-kit push`) against the Neon `DATABASE_URL` to apply the baseline.
+- **Post-Squash Verification**: Verify the schema is applied and queryable against Neon before releasing. The baseline MUST report a clean, applied state.
+
+## 22. Operational Transparency & Rule Attribution
+- **Rule Attribution Requirement**: When performing any operation that is directly triggered by, required by, or executed in compliance with any of the Global Laws defined in this document, you MUST explicitly state the rule number(s) and brief justification before executing the operation. For example: `[Rule 22 — Transparency] I'm performing this operation because of Rule X (Name) — brief reason.`
+- **Rule References in User Interfaces & Documentation (Admin-Only Restriction)**:
+  - **Strict Admin-Only Scope**: Referencing rule sections, categories, numbers, or standard identifiers in UI elements, alerts, badges, modals, help center articles, compliance checklists, or audit tables is **STRICTLY RESTRICTED to admin-only-facing interfaces** (e.g. `/tools`, `/admin/*`, authenticated administrative panels, operator management dashboards, internal technical developer guides).
+  - **Prohibition in Non-Admin Areas**: Rule sections, numbers, or internal compliance citations MUST NEVER appear anywhere in consumer-, member-, or public-facing areas (e.g. landing pages, user settings, public legal trust centers, normal member dashboards, public error states).
+  - **No Bare Reference Numbers**: Even within authorized admin-only interfaces, UIs and documentation MUST NEVER display an isolated or bare rule reference alone (e.g. displaying just `"Rule 41"`, `"Section 41"`, or `"[41]"`). Every admin-facing reference MUST be accompanied by either:
+    1. A plain-English description of what the standard mandates (e.g. `"Section 41: Dynamic Integration Connections (Zero Hard-Coded Targets & Dual Enrollment)"`), or
+    2. At minimum, the official descriptive title/name of the referenced rule or section (e.g. `"Rule 26 — Containerization & Named Volumes"` or `"Section 41 — Dynamic Integration Standard"`).
+- **Scope**: This applies to all operations including but not limited to: code changes, file modifications, database migrations, security fixes, configuration updates, user interface elements, and architectural decisions.
+- **Exceptions**: Routine operations that are not specifically triggered by a rule (e.g., running a standard build, responding to a direct user request unrelated to a rule) do not require attribution.
+
+## 23. Versioning & Health Endpoints Standard
+- **Single Source of Truth (`APP_VERSION`)**: 
+  - Every project must export `APP_VERSION = pkg.version` from `packages/shared/constants.ts` (or `@shared/constants`).
+  - Never hardcode static version strings or use the deprecated `FLEET_VERSION` alias.
+  - Commit hooks automatically bump `package.json`, which must seamlessly cascade into all version displays.
+- **Standardized `/api/health` Endpoint**:
+  - Every project MUST expose a public, unauthenticated `GET /api/health` returning:
+    ```json
+    {
+      "status": "online" | "maintenance" | "degraded",
+      "maintenance": boolean,
+      "database": "connected" | "disconnected" | "error",
+      "service": "<project-id>",
+      "environment": "production" | "development",
+      "versions": {
+        "production": APP_VERSION,
+        "development": "APP_VERSION-dev"
+      },
+      "timestamp": 1723900000000
+    }
+    ```
+
+## 24. Dedicated Themed Maintenance Mode (`MaintenanceView.tsx`)
+- **Dedicated Maintenance Views**: Every project across the fleet MUST maintain a dedicated `MaintenanceView.tsx` component that activates whenever maintenance mode is active.
+- **Standardized Core Components**:
+  1. **Project Branding**: Must visibly display the official project icon, exact user-viewable display name, and current version (`v{APP_VERSION}`).
+  2. **Themed Boilerplate Narrative**: Must clearly explain that the application is undergoing scheduled maintenance, what that means (data is secure, access temporarily locked), and always refer to itself by its official display name.
+  3. **Auto-Polling & Reconnect**: Must poll `/api/health` every 15–30s to automatically reload when back online, plus provide a manual "Check Connectivity" action button.
+- **Visual Theming**: The visual presentation, colors, animations, and narrative tone must be custom-tailored to the project's identity (e.g., Command Center for Foundation, Shonen Comic for GloBot, Encrypted Vault for LEDGER, Fresh Pantry for FOOD).
+
+## 25. Acronym Display Naming Standards
+- **Acronym Casing**: For all project names that represent acronyms, user-viewable display names MUST always display the acronym portion of the name in **ALL CAPS**.
+- **Recognized Acronym Names Across the Fleet**:
+  - **`I AM`** (Entire name in ALL CAPS)
+  - **`LEDGER`** (Entire name in ALL CAPS)
+  - **`LETS Draw-Down`** (`LETS` in ALL CAPS, `Draw-Down` in Title Case)
+  - **`FOOD`** (Entire name in ALL CAPS)
+- **Application**: When referencing any of these projects in user-facing UI, alerts, toasts, logs, maintenance views, and documentation, always use their exact standardized display name with acronym casing.
+
+
+## 26. Containerization, Portainer Stacks & Named Volumes Standard
+- **1Password Secret Management for Containers & Stacks**:
+  - All container environment variables and stack credentials MUST be centralized in the **`Self-Hosted Infrastructure`** (`57s77wi4sbpj5zxxm7habzczo4`) 1Password vault.
+  - Stack items MUST be created with the **`API Credential`** category (e.g., `Voyarr Stack`, `RomM Stack`).
+  - **Two-Tier Alphabetical Categorization & Sorting (A–Z)**:
+    - **Section Categories**: All section categories within a stack item MUST be sorted alphabetically (**A–Z**), for example:
+      1. *Authentication & Security*
+      2. *Container Settings*
+      3. *Database*
+      4. *Integrations & Cloudflare*
+      5. *Network & Ports*
+      6. *Storage & Volume Paths*
+    - **Variables within Sections**: All variables inside every section MUST also be sorted alphabetically (**A–Z**) by variable name.
+  - **Item Metadata**: Every stack item MUST include comprehensive documentation in its notes (architecture overview, service breakdowns, volume mappings) and relevant operational tags.
+- **Context-Aware Base Image Policy (Alpine vs. Debian Slim)**:
+  - **Alpine Base Images (`nginx:alpine`, `caddy:alpine`, `alpine:latest`)**:
+    - MUST be used for pure static web servers (SPAs), reverse proxies, multi-stage production web hosts, and lightweight maintenance/sidecar containers to minimize image size (~15–25 MB), attack surface, and CVE footprint.
+  - **Debian Slim Base Images (`node:<version>-slim`, `python:<version>-slim`)**:
+    - MUST be used for dynamic backend APIs, microservices, and any containerized runtime that depends on native C/C++ bindings (crypto, WebAuthn, PBKDF2/argon2, image rendering, SQLite/PostgreSQL drivers) to ensure `glibc` performance and avoid `musl` compilation overhead.
+- **Docker Named Volumes Policy (`{project_name}-{volume_category}`)**:
+  - All **functional/runtime container volumes** (configuration, state files, databases, automated backups, TLS certs) MUST use standard Docker named volumes formatted strictly as:
+    ```
+    {project_name}-{volume_category}
+    ```
+    *(e.g., `voyarr-config`, `voyarr-backups`, `voyarr-certs`, `voyarr-db-data`, `voyarr-tailscale-state`, `romm-config`, `romm-db-data`)*.
+  - **Host Media & Storage Mounts Standard**:
+    - **Local Driver Bind Named Volumes (Recommended Standard)**: To ensure consistent Docker volume abstraction, visibility across Portainer fleet management, and zero risk of data loss on large host datasets, storage mounts (both functional config/databases and large media pools such as `/video`, `/series`, `/volume1/downloads`) SHOULD be declared as top-level named volumes backed by the `local` driver with `o: bind` options:
+      ```yaml
+      volumes:
+        {project_name}-config:
+          driver: local
+          driver_opts:
+            type: none
+            o: bind
+            device: ${PATH_CONFIG}
+        {project_name}-media-{category}:
+          driver: local
+          driver_opts:
+            type: none
+            o: bind
+            device: ${PATH_MEDIA}
+      ```
+    - **Zero-Loss Data Safety**: Local bind named volumes map directly to existing host paths without copying, relocating files, or risking storage wipes. If migrating standard local Docker managed volumes (`/var/lib/docker/volumes`), existing data MUST be transferred into the initialized volume before deprecating the old path.
+    - **Ephemeral Scratch Mounts (`tmpfs`)**: Ephemeral caches, transcode directories, and scratch folders (such as Plex transcoder, temporary unpack/scrape folders) MUST be mounted into memory using `tmpfs` (e.g. `tmpfs: - /transcode:size=8G,uid=${PUID},gid=${PGID},mode=0755`) to eliminate SSD/HDD write wear, eliminate storage latency, and avoid I/O contention with SQLite/PostgreSQL databases.
+- **Portainer Compose Manifest Declarations**:
+  - **Mandatory `unless-stopped` Restart Policy**: Every deployable container service across the fleet MUST explicitly declare `restart: "${RESTART_POLICY:-unless-stopped}"` (with fallback default `unless-stopped`). The restart policy MUST always resolve to `unless-stopped`. Under no circumstances should `always`, `on-failure`, or no restart policy be used.
+  - Docker compose files MUST explicitly declare all functional named volumes in the top-level `volumes:` manifest block with explicit `name:` attributes.
+  - Secrets and environment variables MUST be referenced via variable interpolation (`${VAR_NAME}`) rather than hardcoded credentials.
+- **Fully Environment-Variable Parameterized Compose Standard**:
+  - **Zero Hardcoded Environment-Specific Values**: Every deployable Docker Compose stack across the fleet MUST be 100% environment-variable parameterized. Hardcoding host paths, container port mappings, external network names, image tags, user/group IDs, or credentials directly in compose files is strictly prohibited.
+  - **Defensive Parameterization Syntax**:
+    - **Required Secrets & Sensitive Keys**: MUST use mandatory variable interpolation (`${VAR_NAME}`) without fallback defaults, failing fast if the variable is omitted from the deployment environment or 1Password injection.
+    - **Configurable Operational Attributes**: MUST use fallback interpolation syntax (`${VAR_NAME:-default_value}`) for non-sensitive operational attributes (e.g. ports: `"${APP_PORT:-8080}:8080"`, user IDs: `"${PUID:-1000}:${PGID:-1000}"`, restart policies: `restart: "${RESTART_POLICY:-unless-stopped}"`, image tags: `"${IMAGE_TAG:-latest}"`, timezones: `"${TZ:-UTC}"`).
+    - **Host Volume Bind Mounts**: MUST parameterize the host-side path (e.g. `"${HOST_MEDIA_PATH:-/media/storage}:/media/storage"` or `"${HOST_BACKUP_PATH:-./backups}:/var/backups"`).
+  - **1Password & `.env.example` Synchronization**:
+    - Every parameterized compose stack MUST have an accompanying `.env.example` (or `.env.template`) file checked into source control documenting every declared variable, its default value, and its intended purpose.
+    - Every variable declared in the compose stack MUST map directly to an entry within the corresponding stack item in the **`Self-Hosted Infrastructure`** (`57s77wi4sbpj5zxxm7habzczo4`) 1Password vault, organized alphabetically (A–Z) by section.
+    - Deployment commands MUST inject secrets dynamically using 1Password CLI reference syntax (`op run --env-file=.env ...` or `op inject`) rather than committing or storing persistent unencrypted `.env` files on host disks.
+- **Rule 26.1 (Downloader Fleet & VPN Gateway Standard - Gluetun)**:
+  - **Mandatory VPN Tunneling for Download Clients**: Any container or stack categorized as a download client (including `qbittorrent`, `nzbget`, `jdownloader2`, `transmission`, `deluge`, `sabnzbd`, or any P2P/Usenet downloader) MUST route its network traffic exclusively through a dedicated, isolated VPN gateway container powered by **Gluetun** (`qmcgaw/gluetun:latest`).
+  - **Dedicated Gateway Architecture**: Gluetun MUST be deployed as its own independent stack (e.g., `gluetun` / Stack #316 on Env #2) so that updating, restarting, or reconfiguring downloaders never terminates or disrupts the underlying VPN tunnel.
+  - **Network Attachment Mode**: All downloader containers MUST declare `network_mode: "container:gluetun"` (or `network_mode: "service:vpn"` when co-located in a dedicated single stack). Downloader service definitions MUST NOT declare independent `ports:` or `networks:` blocks.
+  - **Centralized Port Publishing**: All external port forwards required for downloader WebUIs (e.g., qBittorrent WebUI `49175->8080`, NZBGet WebUI `49183->6789`, JDownloader 2 WebUI `32768->5800`) and incoming peer connections (e.g., torrent peer port `49177/tcp+udp`) MUST be published exclusively on the `gluetun` service definition.
+  - **Fail-Safe Kill Switch**: Gluetun's built-in firewall rules MUST remain enabled to ensure a zero-leak kill switch: if the VPN tunnel drops, all non-VPN outbound traffic from all attached containers MUST be blocked immediately.
+  - **Local LAN Whitelisting**: The Gluetun configuration MUST declare `FIREWALL_OUTBOUND_SUBNETS` covering all local LAN subnets and Docker bridge networks (e.g. `172.19.0.0/16,172.20.0.0/16,192.168.0.0/16,10.0.0.0/8`) to ensure WebUI access, local reverse proxy routing, and cross-stack communication remain accessible from local networks.
+
+## 27. Agent & AI Engineering Standards
+- **Automatic Version Bumping**: The git pre-commit hook (`scripts/prepare-commit.cjs`) automatically handles version bumping for staged commits. If manually bumping `package.json` (patch for bug fixes/refactors, minor for new features) before staging and committing, the hook preserves the manual version without double-bumping.
+- **Commit Prefixes**: The commit message must always be prefixed with the newly bumped version from `package.json` in `[vX.Y.Z]` format.
+- **Project Planning & Tracking**: Whenever plans or architectural proposals are created for GitHub, they must be posted directly as **GitHub Issues** and added to the relevant **GitHub Project Boards** rather than created as standalone internal artifacts.
+- **Opportunistic Abstract Refactoring**: Whenever logic or code is being added or modified, if it can be abstractly refactored to increase code quality, DRY principles, and modularity without introducing sacrifices in performance, readability, or complexity, always opt for abstract refactoring.
+- **No Forced Abstractions**: Never force abstract refactoring. If abstraction does not make logical sense, introduces unnecessary layers, complicates debugging, or risks stability in a specific code block, keep the implementation concrete.
+- **Engineering Principles**: Always prioritize methods of coding that are highly efficient, secure, stable, and follow best-practices.
+
+## 28. Cookie Governance & Granular User Consent
+- **Scope & Exclusions**:
+  - Essential authentication cookies (such as `FOUNDATION_SESSION` or isolated media auth cookies like Voyarr) are strictly necessary for platform operation and zero-trust security.
+  - All non-essential client-side cookies, local storage state trackers, functional preference cookies (e.g. `active_guild_id`), and telemetry trackers MUST provide explicit **Opt-In / Opt-Out** controls for end-users.
+- **Consent Architecture**:
+  - The shared consent manager is defined in `packages/shared/cookie-consent` exporting `getCookieConsent()`, `saveCookieConsent()`, and `isCookieCategoryAllowed()`.
+  - Applications MUST mount the universal `CookieConsentBanner` component in their root layout.
+  - Users MUST have the ability to accept all, choose essential only, or customize granular categories (`strictly essential`, `functional preferences`, `analytics & telemetry`).
+  - An event (`gp-open-cookie-preferences`) MUST be dispatched to allow opening the preferences manager from footers, settings, or legal pages.
+
+## 29. Technical Documentation & Legal Alignment Standard
+- **Scope of Technical Documentation**:
+  - Technical documentation includes root markdown specifications (`API.md`, `KNOWLEDGE.md`, `PROJECTS.md`), developer guides (`/api-guide`, `ServiceGuide.tsx`), interactive help centers and walkthrough modals (`TechStackModal.tsx`, `SetupGuideModal.tsx`, `AgentEnrollmentModal.tsx`), how-to articles, and component registry definitions.
+- **Scope of Legal Disclosures**:
+  - Legal disclosures include the unified Trust Center (`apps/web/pages/Legal.tsx`) covering **Terms of Service** (`/legal/terms`), **Privacy Policy** (`/legal/privacy`), **Security Protocol** (`/legal/security`), **Safety & Trust** (`/legal/safety`), and **Cookie Governance** (`/legal/cookies`).
+- **Continuous Documentation Sync**:
+  - All technical documentation, help articles, guides, and legal pages MUST remain in 100% active alignment with the live codebase.
+  - Whenever new endpoints, authentication mechanisms, passkey workflows, background workers, cookies, storage mechanisms, telemetry channels, microservices, or admin tools are introduced, modified, or decommissioned:
+    1. Update all developer and architecture specifications (`API.md`, `KNOWLEDGE.md`, `PROJECTS.md`).
+    2. Synchronize technical descriptions, interactive help center dialogs, how-to guides, and API documentation in `apps/web/`.
+    3. Update the legal disclosures and Trust Center tabs (`/legal/terms`, `/legal/privacy`, `/legal/security`, `/legal/safety`, `/legal/cookies`) with clear, plain-language explanations of operational practices.
+
+## 30. Brand Asset Suite & Multi-Version Directory Structure
+- **Mandatory Full Asset Suite**: Whenever creating or updating application branding, logos, or icon assets for any project in the fleet, you MUST produce a complete, multi-resolution asset suite rather than a single standalone image.
+  - **Required Core Assets Per Version**:
+    1. Master Logo / App Icon (`logo.png` / `icon-512.png` — 512×512)
+    2. PWA App Icons (`icon-192.png` — 192×192, `apple-touch-icon.png` — 180×180)
+    3. Web Favicons (`favicon.png` — 32×32, `favicon.ico` — 32×32)
+    4. Marketing Hero Banner (`marketing_hero.png` — 16:9 widescreen showcase banner)
+    5. Discord / Community Banner (`discord_banner.png` — 16:9 server header banner)
+    6. Directory / App Store Listing Card (`app_listing.png` — 1:1 square formatted listing card)
+
+- **Design Consistency & Motif Purity**:
+  - **Unaltered Master Logo Requirement**: Every individual asset within a given version suite (`v1/`, `v2/`, etc.) MUST feature the **exact same master logo motif without alterations** across the entire suite. No stylistic divergence, emblem deformation, or color deviation is permitted across the assets of that version.
+  - **Wide Asset Rule (16:9 Banners & Marketing Heroes)**: Wide assets must retain the exact same unaltered master logo motif. To optimize widescreen composition, wide assets may be **off-centered** with the unaltered logo anchored on the left side and the official application display name and tagline arranged on the right.
+  - **Transparent Background Law**: Application icons, logos, and badges MUST NEVER have an artificial border background or solid box canvas — the outer background MUST remain **transparent**. The icon artwork itself may feature curved edges, rounded geometry, or organic contours, but must float cleanly without an outer bounding card.
+
+- **Subfolder Layering & Multi-Design Versioning**:
+  - Assets MUST NOT be placed flatly in the root public directory.
+  - They MUST be organized in a dedicated branding subfolder (`public/assets/branding/`) structured to support multiple design iterations and variations.
+  - **Versioned Folder Hierarchy**:
+    ```
+    public/
+      assets/
+        branding/
+          v1/               <-- Design Option / Iteration 1 (Consistent Suite with Unaltered Master Motif)
+            logo.png
+            favicon.png
+            favicon.ico
+            apple-touch-icon.png
+            icon-192.png
+            icon-512.png
+            marketing_hero.png  (16:9 off-centered: unaltered logo left, name/tagline right)
+            discord_banner.png  (16:9 off-centered: unaltered logo left, name/tagline right)
+            app_listing.png     (1:1 transparent background / curved emblem)
+          v2/               <-- Design Option / Iteration 2 (created alongside v1)
+            ...
+          v3/               <-- Design Option / Iteration 3
+            ...
+    ```
+
+- **Dynamic Brand Asset Versioning & Selection Engine**:
+  - **Single Source of Truth**: The active brand version is tracked per project in Foundation's database (`projectThemes` / `platform_settings.activeBrandVersion`, e.g., `'v1'`, `'v2'`, `'v3'`).
+  - **Universal Resolver Helper (`getBrandAsset`)**: All frontend components, themes, and views MUST reference brand assets using the shared `@shared/branding` resolver `getBrandAsset('logo.png')` which evaluates the project's active version path `/assets/branding/${activeVersion}/logo.png`, falling back gracefully to `/assets/branding/v1/logo.png` and root `/logo.png`.
+  - **Administrative Version Switcher**: Foundation's Theme Manager (`/admin/themes`) serves as the central control plane for previewing design iterations and switching the active brand suite across projects with 1-click.
+  - **Edge Fallback Routing**: Edge worker routes MUST intercept requests for root static assets (`/logo.png`, `/favicon.ico`, `/manifest.json`) and route them to the active brand suite.
+
+## 31. Biometric Passkey Step-Up Gate for Destructive Operations & Deletions
+- **Zero Automatic Deletions**: Under NO circumstances should any deletion, revocation, or destructive mutation of credentials, environment variables, containers, stacks, users, groups, or database records occur automatically or silently.
+- **Mandatory Passkey Challenge Before Confirmation**:
+  - Before any deletion confirmation dialog is offered to the administrator in the UI or processed via API, the system MUST enforce a **WebAuthn Biometric Passkey Challenge** (Face ID, Touch ID, or FIDO2 hardware key) verifying a freshness window of $\le 15\text{ minutes}$.
+  - The API endpoint MUST enforce `requirePasskeyFreshness(15)` middleware before processing any `DELETE` or destructive `PUT/PATCH` requests.
+  - If passkey authentication fails or is cancelled, the deletion action is immediately aborted and logged as a denied security event.
+
+## 32. Application, Container & Integration Provisioning Lifecycle
+- **Centralized Credential & Key Lifecycle in Foundation**:
+  - Whenever a new application, container, Portainer stack, Discord bot, or third-party integration is created or modified that requires:
+    1. Credential creation or modification
+    2. High-entropy random key/token generation (API keys, session secrets, salts, encryption keys)
+    3. Environment variable configuration
+    4. Service-to-service credential exchange
+  - It MUST be provisioned, registered, and managed centrally through **Foundation** and **1Password**.
+- **Fleet Application Gateway Standard**:
+  - Connected fleet services (Voyarr, Butlarr, Food, Globot, Groupcord, I-AM, LEDGER, LETS Draw-Down) must authenticate to Foundation's Fleet Gateway (`/api/v1/fleet`) using scoped `X-Fleet-Key` tokens (`ffa_<app>_<uuid>`).
+  - Random key generation must utilize cryptographically secure Web Crypto (`crypto.getRandomValues` / `crypto.randomUUID`) with SHA-256 key hashing in Foundation's database.
+  - Granular scopes (permitted vaults, allowed categories, allowed tags, rate limits, and read/write permission levels) must be enforced at the gateway layer.
+- **Hardening & Zero-Downtime Principles**:
+  - **Immutable Audit Logging**: Every secret read, write, rotation, and revocation MUST record an audit event in `fleetAccessLogs` capturing the actor, IP, timestamp, and target resource.
+  - **Zero-Downtime Key Rotation**: Key rotation procedures must allow graceful overlap during container/service restarts.
+  - **Ephemeral In-Memory Decryption**: Subordinate apps must never cache decrypted vault credentials to persistent disk or localStorage; credentials must only reside in volatile memory or be fetched dynamically via `FleetVaultClient`.
+  - **Drift Detection**: Routine diagnostic checks between Portainer container environment variables and the `Self-Hosted Infrastructure` vault must be performed to detect and alert on unsanctioned out-of-band changes.
+
+## 33. Text Casing and Typography Purity Standard
+- **No Default ALL CAPS Text**:
+  - Under NO circumstances should UI headers, navigation links, menu items, table column titles, role names, usernames, project titles, modal titles, or general typography default to `ALL CAPS` / uppercase (e.g. avoid `LEDGER`, `OWNER`, `USER MANAGEMENT`, `DASHBOARD`, `CREATE ROLE`).
+  - Use standard **Title Case** (e.g., *User Management*, *Permissions & Roles*, *Spreadsheet Import*) or **Sentence case** (e.g., *Create new role*, *Active sessions*) for headers, buttons, navigation items, and labels.
+- **Strict Exceptions for ALL CAPS**:
+  - `ALL CAPS` is permitted ONLY for:
+    1. **Established Acronyms, Initialisms & Acronym-Based Project Names**:
+       - Technical acronyms: `API`, `SDK`, `UI`, `PWA`, `RBAC`, `SSO`, `2FA`, `TOTP`, `CORS`, `IP`, `SQL`, `DNS`, `URL`, `JSON`, `DOM`, `UUID`, `DWD`.
+       - Fleet Application Brands & Projects intentionally stylized or defined as acronyms/initialisms: `I-AM`, `LEDGER` (when defined as an acronym), `LETS` in `LETS Draw-Down`, etc.
+    2. **HTTP Verbs & Database Methods**: `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `OPTIONS`.
+    3. **Micro-Labels & Status Badges with Letter Spacing**: Micro-pills and technical telemetry tags with explicit wide tracking (e.g., `tracking-[0.2em]`, `tracking-widest`) when styled as micro-tags (e.g., `ACTIVE`, `LIVE`, `BETA`).
+    4. **Contextual Syntactic Constants**: Enums, environment variable keys (`DATABASE_URL`), and code constants.
+- **Role Display Names & Presentation**:
+  - Role titles and display badges MUST be formatted in Title Case (*Owner*, *Administrator*, *Moderator*, *Participant*, *Guest*) rather than screaming uppercase (`OWNER`, `ADMIN`).
+
+## 34. Universal Alphabetical (A–Z) Sorting Standard
+- **Default Deterministic Alphabetical Ordering**:
+  - All lists, markdown tables, registry manifests, UI dropdown selectors, navigation catalogs, tool listings, and configuration arrays MUST be dynamically or statically sorted alphabetically (**A–Z**) by their primary key, title, or label.
+- **Strict Exceptions for Canonical & Semantic Orders**:
+  - Alphabetical ordering is waived ONLY for:
+    1. **Privilege & Role Hierarchy**: Ordered by numerical rank (`Owner: 0` → `Admin: 1` → `Moderator: 2` → `User: 3` → `Guest: 4`).
+    2. **Chronological Timelines**: Event streams, activity/audit logs, transactions, and notification feeds ordered by timestamp (`descending / newest first`).
+    3. **Sequential Execution & Migration Workflows**: Step-by-step installation instructions or migration sequences (`0000_...` → `0001_...`).
+    4. **Route Precedence & Relevance Scoring**: Static route precedence over wildcards, or search queries sorted by relevance score.
+
+
+## 35. Modern CSS, Layout & Animation Standards
+- **CSS Anchor Positioning (`anchor()`, `position-anchor`)**:
+  - Temporary floating overlays, contextual tooltips, action popovers, and combobox menus SHOULD leverage native CSS Anchor Positioning where supported, reducing reliance on heavy JavaScript layout measurement loops.
+- **Native Discrete Transitions (`@starting-style` & `transition-behavior: allow-discrete`)**:
+  - Modal entries, drawer slides, and popover animations MUST utilize native CSS `@starting-style` paired with `transition-behavior: allow-discrete` (or modern Framer Motion / Tailwind equivalents) to ensure clean entry/exit transitions without manual JavaScript timeouts.
+- **Fluid Container Queries (`@container`)**:
+  - Reusable cards, telemetry gauges, metric stats widgets, and table viewports MUST implement Container Queries (`@container`) so internal typography and layouts reflow gracefully based on container width rather than full-viewport breakpoints (`@media`).
+
+## 36. Web Performance, Resource Prioritization & View Transitions
+- **Native View Transitions API (`document.startViewTransition`)**:
+  - Fullstack routing and SPA page navigations MUST support the native View Transitions API (`document.startViewTransition()` / React Router `unstable_viewTransition: true` or view transition hooks) for smooth layout and hero-element morphing between route changes.
+- **Resource Hints & Fetch Priority**:
+  - Critical Largest Contentful Paint (LCP) assets (hero graphics, primary logos) MUST declare `fetchpriority="high"`.
+  - External CDN origins and upstream proxy endpoints MUST declare `<link rel="preconnect">` and `<link rel="dns-prefetch">` in the root document to eliminate DNS handshake delays.
+
+## 37. Edge AI, Vector Intelligence & Distributed Tracing
+- **Cloudflare Workers AI & Vectorize Integration**:
+  - Edge intelligence features (semantic search, embedding generation, content summaries, bot intent parsing) MUST utilize native Cloudflare Workers AI (`c.env.AI`) and Vectorize (`c.env.VECTORIZE`) to execute directly at the edge without external API roundtrip overhead.
+- **OpenTelemetry & Distributed Trace Propagation**:
+  - All inter-service communications through the Fleet Application Gateway (`/api/v1/fleet`) and webhook dispatches MUST propagate standard W3C Trace Context headers (`traceparent`, `tracestate`) to maintain end-to-end request visibility across the fleet.
+
+## 38. Unified Fleet Authentication & Default Sign-In Modal Standards
+- **Default Fleet Sign-In Modal (`LoginDialog.tsx`)**:
+  - All micro-applications across the fleet MUST use the standardized `LoginDialog.tsx` from `@shared/auth/client` as their primary authentication gate modal.
+- **Header Icon & Brand Uniformity**:
+  - **App Icon**: The modal header MUST render the application's unique branding icon (`appLogo` / `public/icons/<app>.png` or `public/brand/logo.png`) inside a styled, elevated container with subtle interactive hover scaling.
+  - **Gradient Shaded App Name**: Below the icon, the application's name MUST be rendered in prominent bold Title Case header typography with brand gradient text shading (`bg-gradient-to-r ... bg-clip-text text-transparent`) aligned with the application's theme colors to maintain brand uniformity:
+    - *Foundation*: Cyan $\rightarrow$ Blue $\rightarrow$ Indigo (`from-cyan-400 via-blue-400 to-indigo-400`)
+    - *GloBot*: Red $\rightarrow$ Rose $\rightarrow$ Pink (`from-red-400 via-rose-400 to-pink-500`)
+    - *Groupcord*: Indigo $\rightarrow$ Purple $\rightarrow$ Discord Blurple (`from-indigo-400 via-purple-400 to-[#5865F2]`)
+    - *Ledger*: Emerald $\rightarrow$ Teal $\rightarrow$ Cyan (`from-emerald-400 via-teal-300 to-cyan-400`)
+    - *Food*: Amber $\rightarrow$ Orange $\rightarrow$ Red (`from-amber-400 via-orange-400 to-red-400`)
+    - *Butlarr*: Blue $\rightarrow$ Indigo $\rightarrow$ Violet (`from-blue-400 via-indigo-400 to-violet-400`)
+    - *I-AM*: Amber $\rightarrow$ Yellow $\rightarrow$ Gold (`from-amber-300 via-yellow-400 to-amber-500`)
+    - *Lets-Draw-Down*: Yellow $\rightarrow$ Amber $\rightarrow$ Orange (`from-yellow-400 via-amber-400 to-orange-400`)
+    - *Voyarr*: Fuchsia $\rightarrow$ Purple $\rightarrow$ Indigo (`from-fuchsia-400 via-purple-400 to-indigo-400`)
+- **Unauthenticated Device Pairing (`LoginDialog.tsx`)**:
+  - The unauthenticated sign-in modal's **Device** tab is dedicated exclusively to **Pair This Device**: generating an 8-character one-time pairing PIN (`WDJX-7829`), displaying a live 300s countdown, an instant mobile QR code for camera scans, and running automated background polling (`/api/auth/device/poll`).
+- **In-Line Password Visibility (Reveal Option)**:
+  - All password input fields across the fleet (including `LoginDialog.tsx`, admin setup forms, user settings, and credential management modals) MUST provide an in-line reveal toggle (`Eye` / `EyeOff` action button) allowing users to view the typed value on demand.
+  - Toggling this reveal option switches the input element type between `"password"` and `"text"`, retaining keyboard focus, accessibility labels (`aria-label`), and styling without disrupting input submission.
+- **Authenticated Device Approval (`DeviceApprovalCard.tsx`)**:
+  - Authorizing and approving remote screens MUST be located within the authenticated user's **Security Settings** (`/settings?tab=security` / `UserSettings.tsx` / `DeviceApprovalCard.tsx`).
+  - An authenticated user enters the 8-character PIN displayed on the remote TV, Console, or VR Headset to verify and grant session access via `/api/auth/device/approve`.
+
+## 39. Fleet-Wide Dropdown Component Standard (Native `<select>` Prohibition)
+- **Total Prohibition of Native HTML `<select>`**:
+  - Native HTML `<select>` and `<option>` elements are **STRICTLY PROHIBITED** across all user interfaces, forms, modals, filter toolbars, and settings views in the entire fleet.
+  - All selection controls MUST use the custom, keyboard-accessible, motion-aware `SearchableSelect` component from `@shared/ui/SearchableSelect` or `components/ui/SearchableSelect.tsx`.
+
+- **The 4 Standardized Dropdown Tiers & Qualification Criteria**:
+
+  - **Alignment with API Call Types & Backends**:
+    When a dropdown is connected to or triggers an API call, its tier classification and component behavior MUST directly match the HTTP method and data contract of the corresponding endpoint:
+    - **Tier 1 (Mutating / Entity Creation API)**: Linked to endpoints like `POST /api/entities`, `POST /api/.../tags` that support resource creation alongside listing. Options are populated from a `GET` list query, and the `onCreate` handler executes an authorized `POST` request to create and immediately select the new entity.
+    - **Tier 2 (Static System / Read-Only Lookup API)**: Linked to read-only endpoints like `GET /api/options`, `GET /api/timezones`, or static enum config routes. Search is enabled for fast querying, but mutation (`onCreate`) is strictly omitted.
+    - **Tier 3 (State Transition / Action Dispatch API)**: Linked to action routes like `PUT /api/.../policy`, `PATCH /api/.../status`, or direct operational triggers. These represent finite state machine selections without search or creation overhead.
+    - **Tier 4 (Scraped & Ingested Feed API)**: Linked to crawler/ingestion sync endpoints emitting read-only feeds (often flagged with `X-Data-Source: scraped` or `isScrapedSource: true`). Displays the immutable lock banner and prohibits manual creation.
+
+- **1. Tier 1 — Database-Linked Entity Lists (Searchable + Async Inline Creation)**:
+  - **Definition**: Selection controls whose option records originate from a dynamic, user-modifiable relational/document database store where entities are subject to growth, tagging, categorization, or tenant provisioning.
+  - **API Call Alignment**: Backed by `GET` (for listing) and `POST` (for inline creation) endpoints.
+  - **What Qualifies**:
+    - *Organization Resources & Taxonomy*: Project Tags, Task Categories, Department Labels, Scope Profiles, Custom Roles, Folder Collections, Workspace Channels.
+    - *User & Group Directories*: Tenant Users, Assignees, Notification Recipients, Team Rosters, Customer Profiles.
+    - *Financial & Operational Ledgers*: Budget Categories, Custom Expense Types, Vendor Accounts, Inventory SKU Classifications.
+  - **Qualifying Criteria & Behavior**:
+    - Options are dynamically fetched from an API endpoint or database query.
+    - Full search filtering is enabled (`searchable={true}`).
+    - Inline entity creation is enabled (`onCreate`) whenever the user has write/creation permissions, letting administrators type a new value and persist it directly via an authorized `POST` request without leaving the form.
+
+- **2. Tier 2 — Static Pre-Configured System Lists (Searchable Only, No Creation)**:
+  - **Definition**: Selection controls whose items represent fixed system constants, platform-wide configurations, or standardized enumerations defined by protocols, standards, or system administrators.
+  - **API Call Alignment**: Backed by read-only `GET` query endpoints or static in-memory enum dictionaries.
+  - **What Qualifies**:
+    - *Domain & Network Assets*: Verified Domain Names (`@example.com`), DNS Nameserver Presets, IP Subnet Ranges.
+    - *Localization & Formatting*: IANA Timezones (`America/New_York`), ISO Country Codes, Supported Currencies (`USD`, `EUR`, `CAD`), Locale Languages (`en-US`, `es-ES`).
+    - *Application Themes & Presets*: UI Color Palettes, Brand Iteration Suites (`v1`, `v2`, `v3`), Font Families, Number Formatting Standards.
+  - **Qualifying Criteria & Behavior**:
+    - Options are fixed arrays or system-level configuration tables.
+    - Full search filtering is enabled (`searchable={true}`) for rapid lookups across large sets (e.g. 400+ timezones or 200+ countries).
+    - Arbitrary entity creation is strictly disabled (`onCreate` omitted) to protect system referential integrity.
+
+- **3. Tier 3 — Action, Policy & Operational Function Selectors (No Search, No Creation)**:
+  - **Definition**: Selection controls that toggle operational behaviors, permission policies, display sortings, view filters, or dispatch workflow actions.
+  - **API Call Alignment**: Triggers `PUT`, `PATCH`, or `POST` action calls (e.g. `PUT /api/admin/.../policy`).
+  - **What Qualifies**:
+    - *Access & Posting Policies*: Who Can Post (`ALL_MEMBERS`, `MANAGERS_ONLY`, `PUBLIC_WEB`), Who Can View Conversations, External Member Permissions.
+    - *Roster & Member Roles*: Role Assignment Pickers (`MEMBER`, `MANAGER`, `OWNER`, `AUDITOR`), Affix Target Scopes (`all`, `groups`, `users`, `aliases`).
+    - *View Controls & Toolbars*: Sort Directions (`Newest First`, `Highest Amount`), Filter States (`All`, `Active`, `Suspended`, `Archived`), Page Size Selectors (`25`, `50`, `100`).
+  - **Qualifying Criteria & Behavior**:
+    - Options are small, finite enum sets (typically $\le 6$ mutually exclusive options).
+    - Search filtering is disabled (`searchable={false}`) to preserve a compact, lightweight floating popover without unnecessary text inputs.
+    - Creation is strictly disabled.
+
+- **4. Tier 4 — Scraped & Externally Ingested Read-Only Sources (Immutable Lock)**:
+  - **Definition**: Selection controls populated by external web scrapers, automated background crawlers, upstream sync pipelines, or third-party read-only data feeds.
+  - **API Call Alignment**: Backed by downstream ingestion `GET` endpoints with headers like `X-Data-Source: scraped` or payload flags `{ isScrapedSource: true }`.
+  - **What Qualifies**:
+    - *External Directory Feeds*: WWE / Athletic Superstar Directories, Wikipedia Media Lists, IMDB Filmographies, Public Roster Feeds.
+    - *Upstream Ingested Market & Data Feeds*: Financial Market Tickers, Weather Sensor Feeds, Public Transit Route Schedules, Upstream Provider Catalogs.
+    - *Third-Party Federation Feeds*: Synced Discord Server Roles, External OIDC Provider Claims.
+  - **Qualifying Criteria & Behavior**:
+    - Search filtering is enabled (`searchable={true}`) to navigate large ingested datasets.
+    - Displays a prominent `🔒 Scraped Source (Read-Only)` badge banner with `Immutable` indicator.
+    - Item creation (`onCreate`) is strictly locked (`isScrapedSource={true}`).
+    - Foundation and upstream microservices MUST emit `isScrapedSource: true` / `X-Data-Source: scraped` HTTP headers so downstream child applications automatically lock the dropdown creation behavior.
+
+- **5. Pre-Defined Multi-Value Form Fields (Themed Dropdown Standard)**:
+  - Any form item, filter, or configuration field that accepts multiple values—whether added individually (as tags/chips) or selected multiple at once—where the permitted options are pre-defined, **MUST ALWAYS** be rendered as a themed custom dropdown.
+  - **Plain Text Input Prohibition**: Plain text inputs, comma-separated text boxes, or raw text areas are strictly prohibited for pre-defined multi-values.
+  - **Dropdown Tier Matching**:
+    - If multi-values are user/organization entities supporting runtime creation: Use **Tier 1** (`DatabaseEntitySelect` or `SearchableSelect` with `multiple={true}` + `onCreate`).
+    - If multi-values are fixed system constants (subnets, ports, roles, protocols): Use **Tier 2** (`StaticOptionsSelect` or `SearchableSelect` with `multiple={true}`).
+    - If multi-values are finite operational action/policy toggles: Use **Tier 3** (`ActionPolicySelect` with `multiple={true}`).
+    - If multi-values originate from scraped sources: Use **Tier 4** (`ScrapedSourceSelect` with `multiple={true}`).
+  - Multi-value selections must display dismissable themed chips with animated removal triggers (`X`) and full keyboard navigation.
+
+## 40. Help Center & Technical Documentation Standards
+
+This section governs how integration setup documentation MUST be written, structured, and maintained within the Help Center (`/docs`) and any technical setup guide inside any administration portal. Every supported third-party integration, platform service, or internal infrastructure component MUST comply with each standard below.
+
+### 40.1 Mandatory Integration Documentation Coverage
+Every integration listed in the Help Center MUST include all of the following:
+
+- **Quick-Copy Blueprint Header**: A visually distinct card at the top of each integration guide displaying:
+  - All required environment variable / secret names (exact convention, e.g. `DISCORD_CLIENT_ID`).
+  - Required OAuth2 scopes, API permissions bitfields, or IAM roles — no vague references allowed.
+  - All production and local dev callback, webhook, and health endpoint URIs with one-click copy buttons.
+- **Accordion-Sectioned Setup Steps**: Every multi-step configuration guide MUST use animated, collapsible accordion sections (one accordion per logical setup phase). Acceptable phases: *Console Registration*, *OAuth & Scopes*, *Secrets & Environment Vaulting*, *Webhook & Callback Verification*, *Testing & Health Check*. A top-level "Expand All / Collapse All" trigger is mandatory.
+- **Exact Values — No Assumptions**: All documented values MUST be precisely specified:
+  - Environment variable names MUST match the exact convention used in `wrangler.jsonc`, `.dev.vars`, and `packages/shared/`.
+  - OAuth scopes MUST list every individual scope string (e.g. `identify`, `email`, `guilds.members.read` — not just "standard scopes").
+  - Redirect/callback URIs MUST include both the production URI (`https://[project].gpnet.dev/...`) AND the local dev URI (`http://localhost:[port]/...`).
+  - API token permission sets MUST list every individual permission (e.g. `Account.Workers Scripts:Edit`, not "workers permissions").
+- **Environment Separation Notes**: Where a service distinguishes sandbox/development/production modes, the guide MUST explicitly document each key name and how to select the active environment (e.g. `PLAID_ENV=sandbox|production`).
+- **Security Caveats & Key Safety Warnings**: Any integration step that involves a secret, private key, or credential that cannot be recovered after initial display MUST be accompanied by a prominent amber warning card specifying the one-time disclosure rule and the correct vaulting procedure (1Password → Wrangler secret).
+
+### 40.2 Categorization & Navigation Law
+- **Mandatory Two-Tier Alphabetical Sorting (A–Z)**:
+  - **Category Ordering**: All high-level integration domain categories in navigation sidebars, indices, and selectors MUST be sorted strictly alphabetically (**A–Z**):
+    1. **DevOps & Messaging** (e.g. Email Engine, GitHub CI/CD)
+    2. **Financial Services** (e.g. Arcadia Power, Finance [Plaid], Method FI, Privacy.com)
+    3. **Identity & Authentication** (e.g. Discord, Google Cloud, GroupMe, Microsoft Entra ID, Twitch)
+    4. **Infrastructure & Database** (e.g. Cloudflare, Neon Database, Portainer & Stacks, Service Directory)
+    5. **Productivity & Media** (e.g. Google Drive, Voyarr, YouTube)
+  - **Section & Guide Ordering**: All integration sections and setup guides within every category MUST also be sorted strictly alphabetically (**A–Z**) by their display name (e.g. inside *DevOps & Messaging*, *Email Engine* precedes *GitHub CI/CD*; inside *Financial Services*, *Arcadia Power* precedes *Finance [Plaid]* which precedes *Method FI* which precedes *Privacy.com*).
+- The navigation sidebar or category selector MUST include a live search/filter input that narrows visible integrations by name, secret key name, or category keyword.
+- **Prohibition of Native `<select>`**: Integration navigation controls (desktop sidebar, mobile selector, category picker) MUST comply with Section 39 (Fleet-Wide Dropdown Standard) — native HTML `<select>` elements are strictly prohibited. Mobile integration pickers must use a custom overlay or bottom-sheet-style component.
+
+### 40.3 Documentation Freshness & Maintenance Law
+- When any integration's credentials, API version, OAuth flow, required scopes, endpoint URLs, or permission model changes, the corresponding Help Center section MUST be updated in the same PR/commit as the functional code change. Documentation updates MUST NEVER be deferred to a follow-up task.
+- When a new third-party integration is added to any GameProductions application (Ledger, GloBot, Groupcord, Food, I-AM, Lets-Draw-Down, Butlarr, Voyarr), its full setup guide MUST be added to Foundation's Help Center in the same release as the feature.
+- All environment variable and secret names documented in the Help Center MUST remain in sync with the names declared in `wrangler.jsonc` bindings, `.dev.vars.tpl`, and `packages/shared/` type definitions. Divergence between documentation and code is treated as a critical defect.
+
+### 40.4 Ecosystem Port & Callback Matrix Maintenance
+- The **Ecosystem Callback, Interaction & Port Matrix** (the table showing all apps, their local dev ports, and production callback URLs) MUST be updated every time a new app is added, a port changes, or a domain is reassigned.
+- The matrix MUST always cover all services in the active network at the time of the release.
+
+### 40.5 Prohibited Documentation Anti-Patterns
+The following are strictly prohibited in all Help Center and technical documentation:
+
+- Vague references such as "add required permissions", "configure your environment", "set up standard scopes" — all must be replaced with exact, specific values.
+- Step descriptions that say "save your keys" without specifying the exact environment variable names.
+- Missing local dev callback URLs (only documenting production endpoints).
+- Documenting an integration's existence in the sidebar navigation without providing a corresponding setup guide.
+- Using the word "exhaustive" when describing feature or scope lists.
+- Native browser dialogs (`alert`, `confirm`, `prompt`) for any copy confirmation or status feedback — use toasts or styled inline indicators.
+
+## 41. Dynamic Integration & Tool Connection Standard (Zero Hard-Coded Connections)
+- **Prohibition of Hard-Coded Integration Connections**:
+  - Whenever an integration, service connector, or management tool is added to Foundation or across the ecosystem, the connection between the integration's items, endpoints, nodes, or targets **MUST NEVER BE HARD-CODED**.
+  - Target hosts, ports, IP addresses, container IDs, stack names, credentials, or target application links must never be locked in static source code or rigid static configurations.
+- **Mandatory Dual-Method Enrollment (Manual and Automatic)**:
+  - Every integration tool MUST provide administrators and operators with two clear methods to enroll and manage items:
+    1. **Manual Entry**: Interactive configuration modals/forms to manually enter hosts, ports, protocols, authentication tokens, credentials, or network paths, equipped with in-line pre-flight test connection buttons.
+    2. **Automatic Discovery**: Automated scanning or detection mechanisms to identify and enroll targets automatically (e.g. Portainer stack discovery, Docker socket inspection, subnet/mDNS network sweeps, or Tailscale API device sync).
+- **Persistent State & Runtime Mutability**:
+  - All registered integration items must be persisted in relational tables (or secure state vaults), supporting runtime health monitoring, credential rotation, status verification, and safe deletion.
+

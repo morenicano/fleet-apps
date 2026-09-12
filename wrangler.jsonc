@@ -7,7 +7,10 @@
     "binding": "ASSETS"
   },
   "routes": [
-    "api.gpnet.dev/*"
+    {
+      "pattern": "api.gpnet.dev",
+      "custom_domain": true
+    }
   ],
   "observability": {
     "enabled": true

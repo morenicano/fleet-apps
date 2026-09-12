@@ -34,10 +34,17 @@ app.get('/', (c) => {
       <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-standalone-preset.js"></script>
       <script>
         window.onload = () => {
+          const getSpecUrl = (path) => {
+            if (window.location.hostname === 'localhost') {
+              // Try to find the spec on the current port or 8788 (common for second worker)
+              return path.startsWith('/ledger') ? 'http://localhost:8788' + path : path;
+            }
+            return path;
+          };
+
           window.ui = SwaggerUIBundle({
             urls: [
-              { url: '/ledger/openapi.json', name: 'Ledger API' },
-              { url: '/groupcord/openapi.json', name: 'Groupcord API' }
+              { url: getSpecUrl('/ledger/openapi.json'), name: 'Ledger API' }
             ],
             dom_id: '#swagger-ui',
             deepLinking: true,
