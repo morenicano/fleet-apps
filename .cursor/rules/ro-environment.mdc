@@ -1,0 +1,47 @@
+---
+description: Rules and guidelines for managing Ro's self-hosted infrastructure, devices, and services
+globs: ["**/*ro*", "**/stacks/**", "**/docker/**"]
+alwaysApply: true
+---
+
+# Ro's Infrastructure & Environment Management Rules
+
+## 1. Scope & Automatic Context Mapping
+Whenever the user mentions doing something regarding **Ro** (e.g., "Ro's items", "Ro's NAS", "Ro's stack", "Ro's container", "Ro's setup", "Ro's devices"):
+- **Portainer Target:** Always strictly targets **Portainer Environment 11** (`dxp4800pro-da44`). Never target or modify other Portainer environments.
+- **1Password Vault:** Always strictly targets the dedicated **`Ro - Infrastructure`** vault (Vault ID: `mmfnfxmwexvglqo3g4winlkdmy`). Never query, store, or mix Ro's credentials into `Self-Hosted Infrastructure` or personal vaults.
+- **Hardware Profile:** Targets Ro's UGREEN DXP4800 Pro (Intel 8-core CPU, 32 GB RAM, `/dev/dri` QuickSync hardware encoding).
+
+---
+
+## 2. 1Password Standards (`Ro - Infrastructure` Vault)
+- **Vault Location:** Exclusively `Ro - Infrastructure`.
+- **Title Format:** `<Service/Stack Name> Stack - Ro` (e.g., `Plex Stack - Ro`, `Sonarr Stack - Ro`).
+- **Mandatory Tags:** `Ro`, `Portainer`, `Docker`, `Stack`, and `<service-name>`.
+- **Item Category:** `API Credential`.
+- **Standard Field Structure:**
+  - **General & Container Settings:** `COMPOSE_PROJECT_NAME`, `CONTAINER_NAME`, `IMAGE_NAME`, `IMAGE_TAG`, `PLEX_UID` / `PUID` (default `1000`), `PLEX_GID` / `PGID` (default `1000`), `TZ` (`America/New_York`).
+  - **Network & Ports:** Web UI ports and/or macvlan IP allocations (`media_macvlan`, e.g., `192.168.1.96`).
+  - **Storage & Volume Paths:** Host bind paths conforming to Ro's filesystem (`/volume1/docker/...`, `/volume1/data/...`).
+  - **Service-Specific Performance Sections:** (e.g., *Transcoder & Performance* for Plex/Jellyfin: `TRANSCODE_RAM_SIZE`, `SHM_SIZE`, `DEVICE_DRI`).
+
+---
+
+## 3. Storage, Paths & Permissions Standard
+- **UID / GID Standard:** Default to `1000:1000` for user-space services.
+- **NAS Filesystem Hierarchy:**
+  - Configurations: `/volume1/docker/<service-name>`
+  - Movies: `/volume1/data/movies`
+  - TV Shows: `/volume1/data/shows`
+  - Downloads: `/volume1/data/downloads`
+- **Permissions:** Maintain standard permissions (`umask=002` or `PUID/PGID=1000`) so services can share read/write access across downloaders and media managers.
+
+---
+
+## 4. Portainer Safeguards (Environment 11)
+- **Endpoint Enforcement:** Every Portainer API call, query, or deployment must specify `endpointId=11`.
+- **Strict Isolation:** Zero cross-contamination with personal/primary infrastructure. Never link, reference, or deploy shared stacks across environments.
+- **Stack Update Safety:**
+  - Always verify whether an update will interrupt active downloads or streaming.
+  - Set `prune: false` during stack updates to safeguard external volumes and bind mounts.
+  - Sizing for memory mounts: With Ro's 32GB RAM capacity, allocate 8G–10G `tmpfs` mounts for transcode tasks (`tmpfs: - /transcode:size=10G,mode=1777`), avoiding unbounded `/dev/shm` mounts.
